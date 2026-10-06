@@ -43,7 +43,6 @@ def _format_eta(seconds: float) -> str:
 
 def rebuild_combined(raw_dir: Path, out_path: Path, start: str, end: str,
                       metastock_ascii: bool, log_every: int, log: logging.Logger):
-    date_format = "%m/%d/%Y" if metastock_ascii else "%Y%m%d"
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
 
@@ -104,14 +103,11 @@ def rebuild_combined(raw_dir: Path, out_path: Path, start: str, end: str,
     combined = pd.concat(frames, ignore_index=True)
     combined = combined.dropna(subset=["Open", "High", "Low", "Close"])
 
-    out = combined[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-    out["Date"] = out["Date"].dt.strftime(date_format)
-    out["Symbol"] = out["Ticker"] if metastock_ascii else core._prefixed_symbols_series(out["Ticker"], None)
-    out = out.sort_values(["Date", "Symbol"])
-    out = core._finalize_output_columns(out, metastock_ascii)
+    sort_by = ("Symbol", "Date") if metastock_ascii else ("Date", "Symbol")
+    out = core._format_output(combined, metastock_ascii, sort_by=sort_by)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(out_path, index=False, header=not metastock_ascii)
+    core._write_csv(out, out_path, metastock_ascii)
 
     log.info(f"Wrote combined CSV in {_format_eta(time.time() - t_concat)}: "
               f"{len(out):,} rows, {combined['Ticker'].nunique():,} symbols -> {out_path.resolve()}")
@@ -130,7 +126,8 @@ def main():
     parser.add_argument("--end", default=None,
                          help="Latest date to include (YYYY-MM-DD). Default: today.")
     parser.add_argument("--metastock-ascii", action="store_true",
-                         help="Write the Metastock ASCII layout instead of the headered default")
+                         help="Write the MetaStock ASCII layout (<TICKER>,<PER>,<DTYYYYMMDD>,... header) "
+                              "instead of the default Symbol,Date,... layout")
     parser.add_argument("--log-every", type=int, default=25,
                          help="Log progress every N files (default: 25). Lower for smaller "
                               "batches, raise for very large raw/ directories.")

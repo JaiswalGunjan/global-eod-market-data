@@ -78,10 +78,10 @@ column inside them is always the bare symbol. What's actually sent to
 Yahoo Finance is yf_download_symbol(): the bare ticker plus the exchange's
 suffix for non-US markets (TCS.NS, VOD.L, ...).
 
-Pass --metastock-ascii to instead write the specific multi-symbol layout
-EOD data vendors use for direct MetaStock import: Symbol,Period,Date,Open,
-High,Low,Close,Volume with NO header row, Period always "D" (daily), and
-dates as MM/DD/YYYY by default. This is the format to use if you're
+Pass --metastock-ascii to instead write the MetaStock ASCII layout that
+MetaStock's Downloader converts directly: a <TICKER>,<PER>,<DTYYYYMMDD>,
+<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL> header, bare ticker, Period always "D"
+(daily), dates as YYYYMMDD. This is the format to use if you're
 actually importing into MetaStock itself, rather than just wanting tidy
 CSVs; the default (non --metastock-ascii) layout above is friendlier for
 spreadsheets/pandas/other tools but isn't a recognized MetaStock format.
@@ -832,23 +832,57 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
 # 3. Reorganize into daily CSVs (or per-symbol / combined CSVs)
 # --------------------------------------------------------------------------
 
-# The recognized multi-symbol "MetaStock ASCII (8 column)" convention used
-# by EOD data vendors for direct MetaStock import: Symbol, Period ("D" for
-# daily), Date, Open, High, Low, Close, Volume -- comma-separated, NO header
-# row. (There's also a 7-column variant that drops Open entirely, but 8 is
-# what you want since MetaStock needs Open for its own charts.)
+# MetaStock ASCII layout, as read by MetaStock's Downloader (File > Convert,
+# source "ASCII Text"): one record per line, comma-separated, with a header
+# row of MetaStock field names so the Downloader identifies every column on
+# its own -- without that header it treats the first data line as the header
+# and the convert fails. Dates are YYYYMMDD (matching <DTYYYYMMDD>), records
+# are written in ascending date order per symbol, prices are rounded to 4
+# decimals, volume is a whole number, and lines end in CRLF.
 METASTOCK_ASCII_COLUMNS = ["Symbol", "Period", "Date", "Open", "High", "Low", "Close", "Volume"]
+METASTOCK_HEADER = ["<TICKER>", "<PER>", "<DTYYYYMMDD>", "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<VOL>"]
+METASTOCK_DATE_FORMAT = "%Y%m%d"
+PRICE_DECIMALS = 4
 
 
-def _finalize_output_columns(df: pd.DataFrame, metastock_ascii: bool) -> pd.DataFrame:
-    """Apply strict MetaStock ASCII column layout (adds a Period='D' column,
-    reorders to Symbol,Period,Date,O,H,L,C,V) when requested; otherwise keep
-    the friendlier Symbol,Date,O,H,L,C,V layout used elsewhere in this tool."""
+def metastock_symbol(ticker: str) -> str:
+    """Bare ticker as MetaStock should see it -- Yahoo's index caret is
+    dropped ('^NSEI' -> 'NSEI') since it isn't a valid MetaStock symbol char."""
+    return str(ticker).lstrip("^")
+
+
+def _format_output(df: pd.DataFrame, metastock_ascii: bool, date_format: str = None,
+                   exchange_map=None, sort_by=("Date", "Symbol")) -> pd.DataFrame:
+    """Turn raw-cache rows (Ticker, Date as Timestamp, O/H/L/C/V) into output
+    rows. Sorting happens on the real Timestamp BEFORE the date is turned into
+    text, so a format like MM/DD/YYYY can't scramble the chronological order.
+
+    metastock_ascii=True -> Symbol,Period,Date,O,H,L,C,V with the bare ticker
+    and YYYYMMDD dates (write it with _write_csv(..., metastock_ascii=True) to
+    get the MetaStock header). Otherwise -> the friendlier
+    Symbol,Date,O,H,L,C,V layout with exchange-prefixed symbols."""
+    out = df[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]].copy()
     if metastock_ascii:
-        df = df.copy()
-        df["Period"] = "D"
-        return df[METASTOCK_ASCII_COLUMNS]
-    return df[["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]]
+        out["Symbol"] = out["Ticker"].map(metastock_symbol)
+    else:
+        out["Symbol"] = _prefixed_symbols_series(out["Ticker"], exchange_map)
+    out = out.sort_values(list(sort_by), kind="stable")
+    for c in ("Open", "High", "Low", "Close"):
+        out[c] = out[c].round(PRICE_DECIMALS)
+    out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce").fillna(0).round().astype("int64")
+    if metastock_ascii:
+        out["Date"] = out["Date"].dt.strftime(METASTOCK_DATE_FORMAT)
+        out["Period"] = "D"
+        return out[METASTOCK_ASCII_COLUMNS]
+    out["Date"] = out["Date"].dt.strftime(date_format or "%Y%m%d")
+    return out[["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
+def _write_csv(df: pd.DataFrame, path: Path, metastock_ascii: bool):
+    if metastock_ascii:
+        df.to_csv(path, index=False, header=METASTOCK_HEADER, lineterminator="\r\n")
+    else:
+        df.to_csv(path, index=False)
 
 
 def _bare_ticker_from_filename(stem: str) -> str:
@@ -930,19 +964,23 @@ def report_data_quality(raw_dir: Path, tickers, exchange_map=None):
 
 
 
-def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
-                      date_format: str = None, tickers=None, exchange_map=None,
-                      metastock_ascii: bool = False):
-    date_format = date_format or ("%m/%d/%Y" if metastock_ascii else "%Y%m%d")
-    daily_dir.mkdir(parents=True, exist_ok=True)
+def _exchange_from_filename(stem: str):
+    """'NSE.TCS' -> 'NSE'; None when the raw file has no exchange prefix."""
+    for ex, prefix in EXCHANGE_PREFIX.items():
+        if stem.startswith(f"{prefix}."):
+            return ex
+    return None
+
+
+def _load_raw_frames(raw_dir: Path, start: str, end: str, tickers=None, exchange_map=None,
+                     with_exchange: bool = False):
+    """Read the selected raw/ cache files, trim to [start, end], and return one
+    DataFrame (or None if there's nothing). with_exchange=True adds an
+    Exchange column taken from each file's name prefix."""
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
-
-    raw_files = _select_raw_files(raw_dir, tickers, exchange_map)
-    log.info(f"Combining {len(raw_files)} cached ticker files...")
-
     frames = []
-    for f in raw_files:
+    for f in _select_raw_files(raw_dir, tickers, exchange_map):
         try:
             df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
         except Exception as e:
@@ -953,29 +991,74 @@ def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
         if "Ticker" not in df.columns:
             df["Ticker"] = _bare_ticker_from_filename(f.stem)
         df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
-        if not df.empty:
-            frames.append(df)
-
+        if df.empty:
+            continue
+        if with_exchange:
+            df["Exchange"] = _exchange_from_filename(f.stem) or "OTHER"
+        frames.append(df)
     if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
+                      date_format: str = None, tickers=None, exchange_map=None,
+                      metastock_ascii: bool = False):
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Combining cached ticker files...")
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map)
+    if combined is None:
         log.warning("No data found to build daily CSVs from.")
         return
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.dropna(subset=["Open", "High", "Low", "Close"])
 
     n_days = combined["Date"].nunique()
     log.info(f"Writing {n_days} daily CSV files to {daily_dir} ...")
 
     for date, group in combined.groupby("Date"):
-        out = group[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-        out["Date"] = out["Date"].dt.strftime(date_format)
-        out["Symbol"] = out["Ticker"] if metastock_ascii else _prefixed_symbols_series(out["Ticker"], exchange_map)
-        out = out.sort_values("Symbol")
-        out = _finalize_output_columns(out, metastock_ascii)
-        fname = daily_dir / f"{date.strftime('%Y%m%d')}.csv"
-        out.to_csv(fname, index=False, header=not metastock_ascii)
+        out = _format_output(group, metastock_ascii, date_format, exchange_map, sort_by=("Symbol",))
+        _write_csv(out, daily_dir / f"{date.strftime('%Y%m%d')}.csv", metastock_ascii)
 
     log.info("Done building daily CSV files.")
+
+
+def build_bhavcopy_files(raw_dir: Path, bhav_dir: Path, start: str, end: str,
+                         tickers=None, exchange_map=None):
+    """Bhavcopy-style output: one MetaStock ASCII file per exchange per
+    trading day holding every downloaded stock's OHLCV for that day, at
+    bhav_dir/<EXCHANGE>/<EXCHANGE>_<YYYYMMDD>.csv (exchanges are kept apart
+    so the same bare ticker on e.g. NSE and BSE never collides).
+
+    The folder accumulates across runs: an existing day file is merged, not
+    replaced -- rows for the tickers in this run are swapped for fresh ones
+    and every other ticker already in the file is kept. So downloading one
+    stock today just adds/updates that stock in each day's file."""
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map, with_exchange=True)
+    if combined is None:
+        log.warning("No data found to build bhavcopy files from.")
+        return
+
+    n_written = 0
+    for ex, ex_rows in combined.groupby("Exchange"):
+        ex_dir = bhav_dir / ex
+        ex_dir.mkdir(parents=True, exist_ok=True)
+        run_symbols = set(ex_rows["Ticker"].map(metastock_symbol))
+        for date, group in ex_rows.groupby("Date"):
+            out = _format_output(group, metastock_ascii=True, sort_by=("Symbol",))
+            path = ex_dir / f"{ex}_{date.strftime('%Y%m%d')}.csv"
+            if path.exists():
+                try:
+                    old = pd.read_csv(path, dtype={"<TICKER>": str, "<DTYYYYMMDD>": str})
+                    old.columns = METASTOCK_ASCII_COLUMNS
+                    old = old[~old["Symbol"].isin(run_symbols)]
+                    out = pd.concat([old, out], ignore_index=True).sort_values("Symbol", kind="stable")
+                except Exception as e:
+                    log.warning(f"Rewriting unreadable bhavcopy file {path.name}: {e}")
+            _write_csv(out, path, metastock_ascii=True)
+            n_written += 1
+        log.info(f"Bhavcopy: {ex} -- {ex_rows['Date'].nunique():,} day file(s), "
+                 f"{len(run_symbols):,} symbol(s) -> {ex_dir}")
+    log.info(f"Done building {n_written:,} bhavcopy file(s) under {bhav_dir}")
 
 
 def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
@@ -983,53 +1066,26 @@ def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
                         metastock_ascii: bool = False):
     """Club every ticker's data across the whole date range into ONE CSV.
 
-    Columns: Symbol,Date,Open,High,Low,Close,Volume (or, with
-    metastock_ascii=True: Symbol,Period,Date,Open,High,Low,Close,Volume,
-    no header -- the recognized multi-symbol MetaStock ASCII layout).
-    Sorted by Date then Symbol.
+    Default columns: Symbol,Date,Open,High,Low,Close,Volume, sorted by Date
+    then Symbol. With metastock_ascii=True: the MetaStock ASCII layout (see
+    METASTOCK_HEADER) sorted by Symbol then Date, so each security's records
+    arrive together and in date order as MetaStock's converter expects.
 
     NOTE: for the full NYSE+NASDAQ universe over 10 years, this single
     file can be very large (tens of millions of rows, likely 1GB+). If
     that's too unwieldy for your downstream tool, prefer --layout daily
     or --layout per-symbol instead.
     """
-    date_format = date_format or ("%m/%d/%Y" if metastock_ascii else "%Y%m%d")
-    start_dt = pd.Timestamp(start)
-    end_dt = pd.Timestamp(end)
-
-    raw_files = _select_raw_files(raw_dir, tickers, exchange_map)
-    log.info(f"Building combined single CSV from {len(raw_files)} cached ticker files...")
-
-    frames = []
-    for f in raw_files:
-        try:
-            df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
-        except Exception as e:
-            log.warning(f"Skipping unreadable file {f.name}: {e}")
-            continue
-        if df.empty:
-            continue
-        if "Ticker" not in df.columns:
-            df["Ticker"] = _bare_ticker_from_filename(f.stem)
-        df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
-        if not df.empty:
-            frames.append(df)
-
-    if not frames:
+    log.info("Building combined single CSV from cached ticker files...")
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map)
+    if combined is None:
         log.warning("No data found to build the combined CSV from.")
         return
 
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.dropna(subset=["Open", "High", "Low", "Close"])
-
-    out = combined[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-    out["Date"] = out["Date"].dt.strftime(date_format)
-    out["Symbol"] = out["Ticker"] if metastock_ascii else _prefixed_symbols_series(out["Ticker"], exchange_map)
-    out = out.sort_values(["Date", "Symbol"])
-    out = _finalize_output_columns(out, metastock_ascii)
-
+    sort_by = ("Symbol", "Date") if metastock_ascii else ("Date", "Symbol")
+    out = _format_output(combined, metastock_ascii, date_format, exchange_map, sort_by=sort_by)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(out_path, index=False, header=not metastock_ascii)
+    _write_csv(out, out_path, metastock_ascii)
     log.info(f"Wrote combined CSV ({len(out):,} rows, {combined['Ticker'].nunique():,} symbols) to {out_path}")
 
 
@@ -1037,15 +1093,13 @@ def build_per_symbol_csvs(raw_dir: Path, out_dir: Path, start: str, end: str,
                            date_format: str = None, tickers=None, exchange_map=None,
                            metastock_ascii: bool = False):
     """Alternative layout: one CSV per symbol (classic Metastock ASCII import).
-    Files are named after the (possibly exchange-prefixed) output symbol,
-    e.g. NASDAQ.AAPL.csv, not the raw download ticker."""
-    date_format = date_format or ("%m/%d/%Y" if metastock_ascii else "%Y%m%d")
+    Files are named after the output symbol: exchange-prefixed by default
+    (NASDAQ.AAPL.csv), the bare MetaStock symbol with metastock_ascii."""
     out_dir.mkdir(parents=True, exist_ok=True)
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
 
     raw_files = _select_raw_files(raw_dir, tickers, exchange_map)
-    exchange_map = exchange_map or {}
     for f in raw_files:
         try:
             df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
@@ -1054,18 +1108,16 @@ def build_per_symbol_csvs(raw_dir: Path, out_dir: Path, start: str, end: str,
         if df.empty:
             continue
         df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
         if df.empty:
             continue
-        df = df.sort_values("Date")
-        df["Date"] = df["Date"].dt.strftime(date_format)
-        ticker = df["Ticker"].iloc[0] if "Ticker" in df.columns else _bare_ticker_from_filename(f.stem)
-        # In strict MetaStock ASCII mode, use the bare ticker -- MetaStock
-        # needs this to match your existing security codes, and a prefixed
-        # symbol like "NASDAQ.AAPL" would just look like an unrelated new symbol.
-        symbol = ticker if metastock_ascii else prefixed_symbol(ticker, exchange_map.get(ticker))
-        df["Symbol"] = symbol
-        df = _finalize_output_columns(df, metastock_ascii)
-        df.to_csv(out_dir / f"{symbol}.csv", index=False, header=not metastock_ascii)
+        if "Ticker" not in df.columns:
+            df["Ticker"] = _bare_ticker_from_filename(f.stem)
+        # In MetaStock mode the symbol is the bare ticker -- MetaStock needs it
+        # to match your existing security codes; "NASDAQ.AAPL" would look like
+        # an unrelated new symbol.
+        out = _format_output(df, metastock_ascii, date_format, exchange_map, sort_by=("Date",))
+        _write_csv(out, out_dir / f"{out['Symbol'].iloc[0]}.csv", metastock_ascii)
 
     log.info(f"Wrote per-symbol CSVs to {out_dir}")
 
@@ -1129,14 +1181,13 @@ def parse_args():
                          "are I/O-bound so threads help a lot; raise cautiously, or lower to 1 "
                          "for fully serial downloads if you start seeing rate-limit errors.")
     p.add_argument("--date-format", default=None,
-                    help="strftime format for the Date column. Default: %%Y%%m%%d normally, "
-                         "or %%m/%%d/%%Y automatically when --metastock-ascii is set.")
+                    help="strftime format for the Date column (default %%Y%%m%%d). Ignored with "
+                         "--metastock-ascii, which always uses YYYYMMDD to match its header.")
     p.add_argument("--metastock-ascii", action="store_true",
-                    help="Write the recognized multi-symbol 'MetaStock ASCII' layout instead of "
-                         "the default one: Symbol,Period,Date,Open,High,Low,Close,Volume with NO "
-                         "header row and Period always 'D' (daily) -- this is the format EOD data "
-                         "vendors use for direct MetaStock import. Applies to whichever --layout "
-                         "you've chosen (daily/per-symbol/combined/all).")
+                    help="Write the MetaStock ASCII layout instead of the default one: header "
+                         "<TICKER>,<PER>,<DTYYYYMMDD>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>, bare "
+                         "ticker, Period 'D', YYYYMMDD dates -- what MetaStock's Downloader "
+                         "converts directly. Applies to whichever --layout you've chosen.")
     p.add_argument("--split-by-exchange", action="store_true",
                     help="Download and build output into separate NASDAQ/ and NYSE/ subfolders "
                          "under --output, each with its own raw/ cache and its own daily/by_symbol/"
@@ -1149,13 +1200,18 @@ def parse_args():
                          "daily files -- complete, covers BSE-only stocks, but downloads one file "
                          "per trading day (cached under <output>/bhavcopy_cache) so a first "
                          "10-year run takes a while.")
+    p.add_argument("--no-bhavcopy", action="store_true",
+                    help="Don't write the per-day bhavcopy files (<output>/bhavcopy/<EXCHANGE>/"
+                         "<EXCHANGE>_YYYYMMDD.csv, MetaStock ASCII, every stock for that day). "
+                         "They're built after every run by default, whatever --layout is.")
     p.add_argument("--no-split-adjust", action="store_true",
                     help="With --bse-source bhavcopy: leave prices unadjusted for splits/bonuses "
                          "(default adjusts them using Yahoo's corporate-actions data).")
     return p.parse_args()
 
 
-def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_dir, combined_path, args):
+def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_dir, combined_path,
+                        bhavcopy_dir, args):
     """Runs the full download -> build pipeline for one set of tickers into
     one set of directories. Building only happens once, after every
     download in this batch has finished -- not incrementally per-ticker."""
@@ -1182,6 +1238,9 @@ def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_di
         build_combined_csv(raw_dir, combined_path, args.start, args.end, args.date_format,
                             tickers=tickers, exchange_map=exchange_map,
                             metastock_ascii=args.metastock_ascii)
+    if not args.no_bhavcopy:
+        build_bhavcopy_files(raw_dir, bhavcopy_dir, args.start, args.end,
+                             tickers=tickers, exchange_map=exchange_map)
 
 
 def main():
@@ -1243,13 +1302,13 @@ def main():
             _download_and_build(
                 ex_tickers, ex_exchange_map,
                 ex_dir / "raw", ex_dir / "daily", ex_dir / "by_symbol",
-                ex_dir / "combined" / "all_data.csv", args,
+                ex_dir / "combined" / "all_data.csv", out_root / "bhavcopy", args,
             )
     else:
         _download_and_build(
             tickers, exchange_map,
             out_root / "raw", out_root / "daily", out_root / "by_symbol",
-            out_root / "combined" / "all_data.csv", args,
+            out_root / "combined" / "all_data.csv", out_root / "bhavcopy", args,
         )
 
     log.info("All done.")

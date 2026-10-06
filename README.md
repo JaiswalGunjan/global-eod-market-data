@@ -289,9 +289,21 @@ market_data/
 │   ├── 20160119.csv
 │   └── ...
 ├── by_symbol/                # optional, see "Metastock format" below
-└── combined/
-    └── all_data.csv          # optional: every ticker + every date in ONE file
+├── combined/
+│   └── all_data.csv          # optional: every ticker + every date in ONE file
+└── bhavcopy/                 # always built (unless --no-bhavcopy), MetaStock ASCII
+    ├── NSE/NSE_20240102.csv      # one file per exchange per trading day,
+    ├── NYSE/NYSE_20240102.csv    # every downloaded stock for that day
+    └── ...
 ```
+
+`bhavcopy/` mirrors the BSE/NSE bhavcopy idea for every exchange: each day's
+file holds all stocks for that day, already in MetaStock ASCII format, so you
+can point MetaStock's Downloader at a folder and convert day by day. It
+accumulates across runs -- downloading one more stock adds/updates just that
+stock in each existing day file and keeps everything else. With
+`--split-by-exchange` it still lives at the top level (`market_data/bhavcopy/`).
+Turn it off with `--no-bhavcopy` (CLI) or the checkbox in the GUI.
 
 Or, with `--split-by-exchange`:
 
@@ -396,19 +408,24 @@ data vendors (e.g. EODData) use for direct MetaStock import — confirmed via
 their published format docs and MetaStock's own community forum:
 
 ```
-Symbol,Period,Date,Open,High,Low,Close,Volume
-AAPL,D,01/15/2016,24.10,24.55,23.90,24.30,185000000
-GE,D,01/15/2016,28.40,28.90,28.10,28.75,41000000
+<TICKER>,<PER>,<DTYYYYMMDD>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>
+AAPL,D,20160115,24.1,24.55,23.9,24.3,185000000
+GE,D,20160115,28.4,28.9,28.1,28.75,41000000
 ```
 
-- **No header row** — the file starts directly with data
+- **Header row of MetaStock field names** — MetaStock's Downloader
+  (File > Convert, source "ASCII Text") reads these to identify the columns.
+  Without it the first data line is taken as the header and the convert fails.
 - **Symbol** is the bare ticker here (`AAPL`, not `NASDAQ.AAPL`) — deliberately
   *not* exchange-prefixed like the default layout is. MetaStock needs this
   to match your existing security codes; a prefixed symbol would just look
-  like an unrelated, brand-new ticker to it.
+  like an unrelated, brand-new ticker to it. Yahoo's index caret is dropped
+  (`^NSEI` -> `NSEI`).
 - **Period** column is always `D` (daily)
-- **Date** defaults to `MM/DD/YYYY` in this mode (override with
-  `--date-format` if your version of MetaStock wants something else)
+- **Date** is always `YYYYMMDD` (`--date-format` is ignored in this mode)
+- Records are in ascending date order per symbol (the combined file is sorted
+  by Symbol, then Date), prices are rounded to 4 decimals, volume is a whole
+  number, and lines end in CRLF
 - Applies to whichever `--layout` you've picked — daily, per-symbol,
   combined, or all
 

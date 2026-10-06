@@ -389,8 +389,14 @@ class MarketDataGUI(tk.Tk):
         self.metastock_ascii_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             layout_frame,
-            text="Strict MetaStock ASCII format (Symbol, Period, Date, O, H, L, C, V -- no header)",
+            text="MetaStock ASCII format (<TICKER>,<PER>,<DTYYYYMMDD>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>)",
             variable=self.metastock_ascii_var,
+        ).pack(anchor="w", padx=8, pady=(2, 2))
+        self.bhavcopy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            layout_frame,
+            text="Also write per-day bhavcopy files for MetaStock (bhavcopy/<EXCHANGE>/<EXCHANGE>_YYYYMMDD.csv)",
+            variable=self.bhavcopy_var,
         ).pack(anchor="w", padx=8, pady=(2, 2))
         self.split_by_exchange_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -467,6 +473,7 @@ class MarketDataGUI(tk.Tk):
             "end_is_today": end_s == today_str,  # so a saved "today" doesn't go stale
             "layout": self.layout_var.get(),
             "metastock_ascii": self.metastock_ascii_var.get(),
+            "bhavcopy": self.bhavcopy_var.get(),
             "split_by_exchange": self.split_by_exchange_var.get(),
             "bse_bhavcopy": self.bse_bhavcopy_var.get(),
             "bse_adjust": self.bse_adjust_var.get(),
@@ -496,6 +503,7 @@ class MarketDataGUI(tk.Tk):
             self._set_dates(start, end)
             self.layout_var.set(s.get("layout", "combined"))
             self.metastock_ascii_var.set(bool(s.get("metastock_ascii", False)))
+            self.bhavcopy_var.set(bool(s.get("bhavcopy", True)))
             self.split_by_exchange_var.set(bool(s.get("split_by_exchange", False)))
             self.bse_bhavcopy_var.set(bool(s.get("bse_bhavcopy", False)))
             self.bse_adjust_var.set(bool(s.get("bse_adjust", True)))
@@ -899,6 +907,7 @@ class MarketDataGUI(tk.Tk):
         split_by_exchange = self.split_by_exchange_var.get()
         bse_source = "bhavcopy" if self.bse_bhavcopy_var.get() else "yahoo"
         bse_adjust = self.bse_adjust_var.get()
+        self.write_bhavcopy = self.bhavcopy_var.get()  # snapshot: worker thread must not read Tk vars
         self.last_output_dir = output_dir
         self._save_settings()
         self.cancel_event.clear()
@@ -971,7 +980,7 @@ class MarketDataGUI(tk.Tk):
                         break
                     core.report_data_quality(ex_dir / "raw", ex_tickers, ex_exchange_map)
                     self._build_outputs(ex_dir, ex_tickers, ex_exchange_map, layout, metastock_ascii,
-                                         start_s, end_s)
+                                         start_s, end_s, output_dir / "bhavcopy")
             else:
                 core.download_all(tickers, start_s, end_s, output_dir / "raw", pause=0.3,
                                    progress_callback=self._on_progress, exchange_map=exchange_map,
@@ -980,7 +989,7 @@ class MarketDataGUI(tk.Tk):
                 if not self.cancel_event.is_set():
                     core.report_data_quality(output_dir / "raw", tickers, exchange_map)
                     self._build_outputs(output_dir, tickers, exchange_map, layout, metastock_ascii,
-                                         start_s, end_s)
+                                         start_s, end_s, output_dir / "bhavcopy")
 
             if self.cancel_event.is_set():
                 self.after(0, self._download_finished, "cancelled",
@@ -993,7 +1002,8 @@ class MarketDataGUI(tk.Tk):
             core.log.error(f"GUI run failed: {e}")
             self.after(0, self._download_finished, "error", str(e))
 
-    def _build_outputs(self, base_dir, tickers, exchange_map, layout, metastock_ascii, start_s, end_s):
+    def _build_outputs(self, base_dir, tickers, exchange_map, layout, metastock_ascii, start_s, end_s,
+                       bhavcopy_dir):
         """Runs once, after all downloads for `tickers` have finished -- never
         incrementally per-ticker, so combining a big batch only happens once."""
         raw_dir = base_dir / "raw"
@@ -1009,6 +1019,9 @@ class MarketDataGUI(tk.Tk):
             core.build_combined_csv(raw_dir, base_dir / "combined" / "all_data.csv", start_s, end_s,
                                      tickers=tickers, exchange_map=exchange_map,
                                      metastock_ascii=metastock_ascii)
+        if self.write_bhavcopy:
+            core.build_bhavcopy_files(raw_dir, bhavcopy_dir, start_s, end_s,
+                                      tickers=tickers, exchange_map=exchange_map)
 
     def _on_progress(self, done, total, failed, no_data):
         self.after(0, self._update_progress_ui, done, total, failed, no_data)
