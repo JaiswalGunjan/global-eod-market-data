@@ -195,8 +195,8 @@ def main():
     ap.add_argument("--root", help="default: market_data_daily (or market_data_hourly with --interval hourly)")
     ap.add_argument("--interval", choices=["daily", "hourly"], default="daily")
     ap.add_argument("--exchanges", nargs="+", choices=US_EXCHANGES, default=US_EXCHANGES)
-    ap.add_argument("--delisted-file", help="Symbols (CSV with Symbol column, or one per line) to download "
-                                            "and treat as delisted names")
+    ap.add_argument("--delisted-file", help="CSV with a Symbol column to download and treat as delisted names; "
+                                            "{ex} in the path is replaced by each exchange")
     ap.add_argument("--start", default="2000-01-01", help="Start date for --delisted-file downloads (daily)")
     ap.add_argument("--split-max-age", type=int, default=7, help="Re-fetch split history older than N days")
     ap.add_argument("--workers", type=int, default=8)
@@ -206,7 +206,7 @@ def main():
     root = Path(args.root or ("market_data_hourly" if hourly else "market_data_daily"))
     for ex in args.exchanges:
         if args.delisted_file:
-            fetch_delisted(root, ex, hourly, args.delisted_file, args.start, args.workers)
+            fetch_delisted(root, ex, hourly, args.delisted_file.format(ex=ex), args.start, args.workers)
         build_exchange(root, ex, hourly, args.split_max_age, args.workers)
 
 
