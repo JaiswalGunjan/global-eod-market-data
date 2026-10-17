@@ -5,8 +5,9 @@
 - [ ] Hourly delisted: no source (Yahoo hourly only covers live symbols; NSE bhavcopies are daily). Probably not possible; confirm and document.
 
 ## NYSE / NASDAQ
-- [ ] Delisted: needs a free Alpha Vantage key -> `us_delisted_list.py`, `us_factors.py --delisted-file`, `update_us.py --include-delisted` (daily and hourly).
-- [ ] Verify the first full `update_us.py` run (all four daily/hourly steps) and spot-check factors against known splits.
+- [x] Delisted: done 2026-10-17 via Alpha Vantage list -> `us_factors.py --delisted-file` -> `update_us.py --skip-download --include-delisted`. Yahoo served only ~7% (NASDAQ 276 of 4,198); the rest needs a paid source.
+- [x] Checked: NYSE yield 210 of 3,314 (~6%); `_load_raw_frames()` skips empty-marker files, so they don't affect builds.
+- [x] Spot-checked daily factors/prices against known splits (2026-10-17): AAPL 4:1, TSLA 5:1+3:1 (x15), NVDA 4:1+10:1 (x40), AMZN/GOOGL 20:1, CMG 50:1, GE 1:8 reverse. As-traded closes match the real pre-split prices. Hourly factors not spot-checked.
 
 ## All exchanges
 - [ ] Dividend / total-return basis; spin-offs and mergers (US).

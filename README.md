@@ -535,6 +535,14 @@ Delisted tickers: Yahoo has no delisted directory, so give `us_factors.py --deli
 `<EX>/delisted_tickers.csv`, and `--include-delisted` adds them to the build. Spin-offs/mergers and
 dividends are not adjusted. Re-run `us_factors.py` after new splits.
 
+Free delisted list: `python us_delisted_list.py` (key via `--api-key` or env `ALPHAVANTAGE_API_KEY`) writes
+`<EX>/delisted_symbols.csv` (NASDAQ 4,198, NYSE 3,314 symbols as of 2026-10-17). Then
+`python us_factors.py --exchanges NYSE NASDAQ --delisted-file "market_data_daily/{ex}/delisted_symbols.csv"`
+and `python update_us.py --skip-download --include-delisted`.
+**Coverage caveat:** Yahoo serves history for only a small share of them (NASDAQ: 276 of 4,198, about 7%;
+NYSE: 210 of 3,314, about 6%; the rest are empty markers, which builds skip). `delisted_tickers.csv` lists every symbol tried, not just those with data.
+Alpha Vantage covers roughly 2010 onward. Complete delisted history needs a paid source (Norgate, Sharadar, CRSP).
+
 **Delisted names.** `--include-delisted` (needs `--price-basis raw`) adds `raw_delisted/` to the build.
 These are as-traded official prices, which is why they only mix with the raw basis. Symbols that kept
 the same ISIN under a new symbol (e.g. L&TFH → LTF) are joined into one series when
