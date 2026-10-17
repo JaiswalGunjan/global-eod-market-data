@@ -194,20 +194,25 @@ def raw_dir_for(out_root: Path, exchange: str) -> Path:
     return out_root / exchange / "raw_1h"
 
 
-def hour_file_path(out_root: Path, exchange: str, ts: pd.Timestamp) -> Path:
-    """<out_root>/<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv, named by the bar's start time."""
-    return out_root / exchange / f"{exchange}_{ts.strftime('%Y%m%d_%H%M')}.csv"
+def hour_file_path(out_root: Path, exchange: str, ts: pd.Timestamp, price_basis: str = "split") -> Path:
+    """<out_root>/<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv, named by the bar's start time.
+    As-traded files go to <EXCHANGE>/as_traded/ so the adjusted files are never overwritten."""
+    folder = out_root / exchange / ("as_traded" if price_basis == "raw" else "")
+    return folder / f"{exchange}_{ts.strftime('%Y%m%d_%H%M')}.csv"
 
 
 def build_hour_files(pairs, out_root: Path, metastock_ascii: bool, start: str = None,
-                     end: str = None, progress_every: float = 60):
+                     end: str = None, progress_every: float = 60, price_basis: str = "split"):
     """Write one file per exchange per hourly bar, holding every ticker's bar
     for that hour: <out_root>/<EX>/<EX>_YYYYMMDD_HHMM.csv. start/end
     (YYYY-MM-DD, inclusive) optionally limit the bars written.
 
     An existing hour file is merged, not overwritten: rows for tickers in
     this run are replaced, other tickers' rows are kept -- so a run for a
-    few tickers doesn't wipe the rest of the market out of the files."""
+    few tickers doesn't wipe the rest of the market out of the files.
+
+    price_basis="raw" converts Yahoo's split-adjusted prices to as-traded ones with the factors from
+    us_factors.py --interval hourly (NYSE/NASDAQ, NSE if scale_factors.csv exists) and writes <EX>/as_traded/."""
     by_exchange = {}
     for ticker, exchange in pairs:
         by_exchange.setdefault(exchange, []).append(ticker)
@@ -228,6 +233,9 @@ def build_hour_files(pairs, out_root: Path, metastock_ascii: bool, start: str = 
             if df.empty:
                 continue
             df["Ticker"] = ticker
+            if price_basis == "raw":
+                df = core._pb.apply_raw_basis(df.dropna(subset=["Open", "High", "Low", "Close"]), exchange,
+                                              raw_dir, date_col="Datetime")
             frames.append(df)
         if not frames:
             log.warning(f"{exchange}: no cached hourly data to write")
@@ -260,7 +268,8 @@ def build_hour_files(pairs, out_root: Path, metastock_ascii: bool, start: str = 
             out["Time"] = ts.strftime("%H%M%S")
             for c in ("Open", "High", "Low", "Close", "Volume"):
                 out[c] = group[c].values
-            path = hour_file_path(out_root, exchange, ts)
+            path = hour_file_path(out_root, exchange, ts, price_basis)
+            path.parent.mkdir(exist_ok=True)
             if path.exists():
                 try:
                     old = pd.read_csv(path, dtype=str)
@@ -313,6 +322,11 @@ def parse_args():
     p.add_argument("--progress-every", type=float, default=60, help="Seconds between progress lines")
     p.add_argument("--metastock-ascii", action="store_true",
                    help="Write <TICKER>,<PER>,<DTYYYYMMDD>,<TIME>,O,H,L,C,<VOL> with PER=60, CRLF")
+    p.add_argument("--price-basis", choices=["split", "raw"], default="split",
+                   help="split = Yahoo's adjusted prices (default). raw = as-traded prices via split factors "
+                        "(run us_factors.py --interval hourly first); written to <EX>/as_traded/")
+    p.add_argument("--include-delisted", action="store_true",
+                   help="Also process NYSE/NASDAQ symbols in <EX>/delisted_tickers.csv (us_factors.py --delisted-file)")
     p.add_argument("--skip-download", action="store_true", help="Only rebuild the hour files from the raw_1h/ caches")
     p.add_argument("--refresh-tickers", action="store_true")
     p.add_argument("--no-etfs", action="store_true")
@@ -327,11 +341,19 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     core.start_file_logging(out_root)
     pairs = resolve_tickers(args)
+    if args.include_delisted:
+        for ex in args.exchanges:
+            reg = out_root / ex / "delisted_tickers.csv"
+            if reg.exists():
+                extra = pd.read_csv(reg, dtype=str)["Symbol"].dropna().tolist()
+                pairs += [(s, ex) for s in extra if (s, ex) not in pairs]
+                log.info(f"{ex}: +{len(extra):,} delisted symbol(s)")
     if not pairs:
         sys.exit("No tickers to process.")
     if not args.skip_download:
         download_all_hourly(pairs, out_root, args.workers, args.progress_every)
-    build_hour_files(pairs, out_root, args.metastock_ascii, progress_every=args.progress_every)
+    build_hour_files(pairs, out_root, args.metastock_ascii, progress_every=args.progress_every,
+                     price_basis=args.price_basis)
     log.info("Done.")
 
 

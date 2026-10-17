@@ -930,13 +930,22 @@ def _select_raw_files(raw_dir: Path, tickers=None, exchange_map=None):
 
 
 def _delisted_files(raw_dir: Path, price_basis: str, include_delisted: bool):
-    """<EX>/raw_delisted/ files (NSE symbols Yahoo no longer serves, from the official bhavcopies).
-    They are as-traded, so they only mix with the 'raw' price basis."""
+    """NSE: <EX>/raw_delisted/ files (symbols Yahoo no longer serves, from the official bhavcopies); as-traded,
+    so they only mix with the 'raw' price basis. NYSE/NASDAQ: raw/ files of the symbols listed in
+    <EX>/delisted_tickers.csv (made by us_factors.py --delisted-file); they go through the normal split factors."""
     if not include_delisted:
         return []
     if price_basis != "raw":
         raise ValueError("--include-delisted needs --price-basis raw (delisted files are as-traded prices)")
-    return sorted((raw_dir.parent / "raw_delisted").glob("NSE.*.csv"))
+    files = sorted((raw_dir.parent / "raw_delisted").glob("NSE.*.csv"))
+    reg = raw_dir.parent / "delisted_tickers.csv"
+    ex = raw_dir.parent.name
+    if reg.exists() and ex in EXCHANGE_PREFIX:
+        for sym in pd.read_csv(reg, dtype=str)["Symbol"].dropna():
+            p = raw_dir / f"{prefixed_symbol(sym, ex)}.csv"
+            if p.exists():
+                files.append(p)
+    return files
 
 
 def _stitch_map(raw_dir: Path):
@@ -1041,9 +1050,9 @@ def _load_raw_frames(raw_dir: Path, start: str, end: str, tickers=None, exchange
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
     frames = []
-    raw_files = (_select_raw_files(raw_dir, tickers, exchange_map)
-                 + _delisted_files(raw_dir, price_basis, include_delisted))
-    stitch = _stitch_map(raw_dir) if include_delisted else {}
+    raw_files = list(dict.fromkeys(_select_raw_files(raw_dir, tickers, exchange_map)
+                                   + _delisted_files(raw_dir, price_basis, include_delisted)))
+    stitch = _stitch_map(raw_dir) if include_delisted and raw_dir.parent.name == "NSE" else {}
     log.info(f"Reading {len(raw_files):,} cached ticker file(s) from {raw_dir} ...")
     progress = _ProgressLog("Reading cached files", len(raw_files))
     for f in raw_files:
@@ -1336,7 +1345,8 @@ def parse_args():
                         "and bhavcopy_raw/ so it never overwrites the adjusted files.")
     p.add_argument("--include-delisted", action="store_true",
                    help="With --price-basis raw: also include NSE symbols from <EX>/raw_delisted/ "
-                        "(delisted/merged names, as-traded; made by nse_delisted.py).")
+                        "(delisted/merged names, as-traded; made by nse_delisted.py) and NYSE/NASDAQ "
+                        "symbols listed in <EX>/delisted_tickers.csv (made by us_factors.py --delisted-file).")
     args = p.parse_args()
     if args.include_delisted and args.price_basis != "raw":
         p.error("--include-delisted requires --price-basis raw")

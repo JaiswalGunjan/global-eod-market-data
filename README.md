@@ -518,6 +518,21 @@ applies `as_traded_price = yahoo_price × Factor` and `volume ÷ Factor` using `
 symbols match within 0.5% (the rest is four-decimal factor rounding and the odd bad Yahoo bar).
 Dividend-adjusted (total-return) prices are **not** implemented.
 
+**NYSE / NASDAQ (daily and hourly), Yahoo only.** No official bhavcopy exists, so `us_factors.py` builds
+`<EX>/recon/scale_factors.csv` from Yahoo's split history (bonus/stock dividends are reported as splits),
+after checking the cached prices around each split date to see whether that part of the cache is already
+as-traded (verdicts in `recon/split_evidence.csv`). Then build with `--price-basis raw`:
+
+    python us_factors.py --exchanges NYSE NASDAQ                              # daily factors
+    python us_factors.py --root market_data_hourly --interval hourly --exchanges NYSE NASDAQ
+    python eod_downloader.py --skip-download --price-basis raw --exchanges NYSE NASDAQ
+    python hourly_downloader.py --skip-download --price-basis raw --exchanges NYSE NASDAQ   # -> <EX>/as_traded/
+
+Delisted tickers: Yahoo has no delisted directory, so give `us_factors.py --delisted-file symbols.txt`
+(a list you supply); those Yahoo still serves are downloaded into the raw cache and registered in
+`<EX>/delisted_tickers.csv`, and `--include-delisted` adds them to the build. Spin-offs/mergers and
+dividends are not adjusted. Re-run `us_factors.py` after new splits.
+
 **Delisted names.** `--include-delisted` (needs `--price-basis raw`) adds `raw_delisted/` to the build.
 These are as-traded official prices, which is why they only mix with the raw basis. Symbols that kept
 the same ISIN under a new symbol (e.g. L&TFH → LTF) are joined into one series when
