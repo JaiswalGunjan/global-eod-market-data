@@ -59,11 +59,13 @@ USAGE
 --------------------------------------------------------------------------
 OUTPUT
 --------------------------------------------------------------------------
-    <output>/raw/<TICKER>.csv          one file per ticker (download cache)
-    <output>/daily/<YYYYMMDD>.csv      one file per trading day
-    <output>/by_symbol/<TICKER>.csv    one file per ticker (--layout per-symbol/all)
-    <output>/combined/all_data.csv     ALL tickers, ALL dates, one file (--layout combined/all)
-    <output>/tickers.csv               the ticker list used for this run
+    Everything is kept per exchange, under <output>/<EXCHANGE>/ (e.g. NSE/):
+    <output>/<EX>/raw/<EX>.<TICKER>.csv    one file per ticker (download cache)
+    <output>/<EX>/daily/<YYYYMMDD>.csv     one file per trading day
+    <output>/<EX>/by_symbol/<TICKER>.csv   one file per ticker (--layout per-symbol/all)
+    <output>/<EX>/combined/all_data.csv    all tickers, all dates (--layout combined/all)
+    <output>/<EX>/bhavcopy/<EX>_YYYYMMDD.csv  per-day MetaStock file (unless --no-bhavcopy)
+    <output>/tickers.csv                   the ticker list used for this run
 
 Each daily CSV has columns:
     Symbol,Date,Open,High,Low,Close,Volume
@@ -122,6 +124,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+
+import price_basis as _pb
 
 try:
     import yfinance as yf
@@ -925,6 +929,34 @@ def _select_raw_files(raw_dir: Path, tickers=None, exchange_map=None):
     return sorted(raw_dir.glob("*.csv"))
 
 
+def _delisted_files(raw_dir: Path, price_basis: str, include_delisted: bool):
+    """<EX>/raw_delisted/ files (NSE symbols Yahoo no longer serves, from the official bhavcopies).
+    They are as-traded, so they only mix with the 'raw' price basis."""
+    if not include_delisted:
+        return []
+    if price_basis != "raw":
+        raise ValueError("--include-delisted needs --price-basis raw (delisted files are as-traded prices)")
+    return sorted((raw_dir.parent / "raw_delisted").glob("NSE.*.csv"))
+
+
+def _stitch_map(raw_dir: Path):
+    """{old_symbol: (new_symbol, first, last)} for the rename chains nse_stitch.py approved (Stitch == Y)."""
+    p = raw_dir.parent / "raw_delisted" / "stitch_report.csv"
+    if not p.exists():
+        log.warning(f"{p} not found -- renamed symbols will not be joined (run nse_stitch.py)")
+        return {}
+    rep = pd.read_csv(p, dtype=str, parse_dates=["OldFirst", "OldLast"])
+    rep = rep[rep["Stitch"] == "Y"]
+    return {o: (n, a, b) for o, n, a, b in zip(rep["Old"], rep["New"], rep["OldFirst"], rep["OldLast"])}
+
+
+def _apply_basis(df: pd.DataFrame, f: Path, raw_dir: Path, price_basis: str) -> pd.DataFrame:
+    """'split' (default) = Yahoo's adjusted prices as cached. 'raw' = as-traded prices (see price_basis.py)."""
+    if price_basis != "raw" or f.parent.name == "raw_delisted":
+        return df
+    return _pb.apply_raw_basis(df, _exchange_from_filename(f.stem), raw_dir)
+
+
 def report_data_quality(raw_dir: Path, tickers, exchange_map=None):
     """Quick post-download sanity check: flag tickers whose cached row
     count is far below the rest of the batch's typical count -- often a
@@ -964,6 +996,33 @@ def report_data_quality(raw_dir: Path, tickers, exchange_map=None):
 
 
 
+class _ProgressLog:
+    """Logs 'label: n/total (pct) | elapsed | ETA' for long build loops, at
+    most once every `interval` seconds plus once at the end, so the log
+    keeps moving without flooding it."""
+
+    def __init__(self, label: str, total: int, interval: float = 5.0):
+        self.label = label
+        self.total = total
+        self.interval = interval
+        self.done = 0
+        self.t_start = time.time()
+        self.t_last = self.t_start
+
+    def step(self, n: int = 1):
+        self.done += n
+        now = time.time()
+        if self.done < self.total and now - self.t_last < self.interval:
+            return
+        self.t_last = now
+        elapsed = now - self.t_start
+        pct = 100 * self.done / self.total if self.total else 100
+        msg = f"{self.label}: {self.done:,}/{self.total:,} ({pct:.0f}%) | elapsed {elapsed:.0f}s"
+        if self.done < self.total and self.done:
+            msg += f" | ETA ~{elapsed / self.done * (self.total - self.done):.0f}s"
+        log.info(msg)
+
+
 def _exchange_from_filename(stem: str):
     """'NSE.TCS' -> 'NSE'; None when the raw file has no exchange prefix."""
     for ex, prefix in EXCHANGE_PREFIX.items():
@@ -973,14 +1032,22 @@ def _exchange_from_filename(stem: str):
 
 
 def _load_raw_frames(raw_dir: Path, start: str, end: str, tickers=None, exchange_map=None,
-                     with_exchange: bool = False):
+                     with_exchange: bool = False, price_basis: str = "split",
+                     include_delisted: bool = False):
     """Read the selected raw/ cache files, trim to [start, end], and return one
     DataFrame (or None if there's nothing). with_exchange=True adds an
-    Exchange column taken from each file's name prefix."""
+    Exchange column taken from each file's name prefix. price_basis="raw"
+    converts to as-traded prices; include_delisted adds <EX>/raw_delisted/."""
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
     frames = []
-    for f in _select_raw_files(raw_dir, tickers, exchange_map):
+    raw_files = (_select_raw_files(raw_dir, tickers, exchange_map)
+                 + _delisted_files(raw_dir, price_basis, include_delisted))
+    stitch = _stitch_map(raw_dir) if include_delisted else {}
+    log.info(f"Reading {len(raw_files):,} cached ticker file(s) from {raw_dir} ...")
+    progress = _ProgressLog("Reading cached files", len(raw_files))
+    for f in raw_files:
+        progress.step()
         try:
             df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
         except Exception as e:
@@ -993,21 +1060,45 @@ def _load_raw_frames(raw_dir: Path, start: str, end: str, tickers=None, exchange
         df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
         if df.empty:
             continue
+        df = _apply_basis(df, f, raw_dir, price_basis)
+        is_official = f.parent.name == "raw_delisted"
+        if is_official and df["Ticker"].iloc[0] in stitch:
+            df["Ticker"] = stitch[df["Ticker"].iloc[0]][0]      # rename chain: old symbol -> current one
+        df["_official"] = is_official
+        if is_official and exchange_map is not None:
+            exchange_map.setdefault(df["Ticker"].iloc[0], _exchange_from_filename(f.stem))   # for NSE.<SYM> prefixes
         if with_exchange:
             df["Exchange"] = _exchange_from_filename(f.stem) or "OTHER"
         frames.append(df)
     if not frames:
         return None
+    log.info(f"Merging {len(frames):,} ticker frame(s) into one table ...")
     combined = pd.concat(frames, ignore_index=True)
-    return combined.dropna(subset=["Open", "High", "Low", "Close"])
+    if stitch:
+        # Official as-traded rows win over the successor's own Yahoo history for the period the old symbol
+        # traded (Yahoo x factor is unreliable there: factors only exist where the new symbol traded).
+        windows = pd.DataFrame(stitch.values(), columns=["Ticker", "First", "Last"])
+        cand = combined.loc[~combined["_official"] & combined["Ticker"].isin(windows["Ticker"]),
+                            ["Ticker", "Date"]].reset_index()
+        hit = cand.merge(windows, on="Ticker")
+        hit = hit[(hit["Date"] >= hit["First"]) & (hit["Date"] <= hit["Last"])]
+        combined = combined.drop(index=hit["index"].unique())
+        combined = combined.sort_values("_official", ascending=False, kind="stable")
+        combined = combined.drop_duplicates(["Ticker", "Date"], keep="first")
+    combined = combined.drop(columns="_official")
+    combined = combined.dropna(subset=["Open", "High", "Low", "Close"])
+    log.info(f"Merged {len(combined):,} rows across {combined['Date'].nunique():,} trading day(s)")
+    return combined
 
 
 def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
                       date_format: str = None, tickers=None, exchange_map=None,
-                      metastock_ascii: bool = False):
+                      metastock_ascii: bool = False, price_basis: str = "split",
+                      include_delisted: bool = False):
     daily_dir.mkdir(parents=True, exist_ok=True)
     log.info("Combining cached ticker files...")
-    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map)
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map,
+                                price_basis=price_basis, include_delisted=include_delisted)
     if combined is None:
         log.warning("No data found to build daily CSVs from.")
         return
@@ -1015,35 +1106,44 @@ def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
     n_days = combined["Date"].nunique()
     log.info(f"Writing {n_days} daily CSV files to {daily_dir} ...")
 
+    progress = _ProgressLog("Daily CSVs written", n_days)
     for date, group in combined.groupby("Date"):
         out = _format_output(group, metastock_ascii, date_format, exchange_map, sort_by=("Symbol",))
         _write_csv(out, daily_dir / f"{date.strftime('%Y%m%d')}.csv", metastock_ascii)
+        progress.step()
 
     log.info("Done building daily CSV files.")
 
 
-def build_bhavcopy_files(raw_dir: Path, bhav_dir: Path, start: str, end: str,
-                         tickers=None, exchange_map=None):
+def build_bhavcopy_files(raw_dir: Path, out_root: Path, start: str, end: str,
+                         tickers=None, exchange_map=None, price_basis: str = "split",
+                         include_delisted: bool = False, folder: str = "bhavcopy"):
     """Bhavcopy-style output: one MetaStock ASCII file per exchange per
     trading day holding every downloaded stock's OHLCV for that day, at
-    bhav_dir/<EXCHANGE>/<EXCHANGE>_<YYYYMMDD>.csv (exchanges are kept apart
-    so the same bare ticker on e.g. NSE and BSE never collides).
+    out_root/<EXCHANGE>/bhavcopy/<EXCHANGE>_<YYYYMMDD>.csv -- inside each
+    exchange's own folder, so the same bare ticker on e.g. NSE and BSE never
+    collides.
 
     The folder accumulates across runs: an existing day file is merged, not
     replaced -- rows for the tickers in this run are swapped for fresh ones
     and every other ticker already in the file is kept. So downloading one
     stock today just adds/updates that stock in each day's file."""
-    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map, with_exchange=True)
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map, with_exchange=True,
+                                price_basis=price_basis, include_delisted=include_delisted)
     if combined is None:
         log.warning("No data found to build bhavcopy files from.")
         return
 
     n_written = 0
     for ex, ex_rows in combined.groupby("Exchange"):
-        ex_dir = bhav_dir / ex
+        ex_dir = out_root / ex / folder
         ex_dir.mkdir(parents=True, exist_ok=True)
         run_symbols = set(ex_rows["Ticker"].map(metastock_symbol))
+        n_days = ex_rows["Date"].nunique()
+        log.info(f"Bhavcopy: writing/merging {n_days:,} {ex} day file(s) into {ex_dir} ...")
+        progress = _ProgressLog(f"Bhavcopy {ex} day files", n_days)
         for date, group in ex_rows.groupby("Date"):
+            progress.step()
             out = _format_output(group, metastock_ascii=True, sort_by=("Symbol",))
             path = ex_dir / f"{ex}_{date.strftime('%Y%m%d')}.csv"
             if path.exists():
@@ -1058,12 +1158,13 @@ def build_bhavcopy_files(raw_dir: Path, bhav_dir: Path, start: str, end: str,
             n_written += 1
         log.info(f"Bhavcopy: {ex} -- {ex_rows['Date'].nunique():,} day file(s), "
                  f"{len(run_symbols):,} symbol(s) -> {ex_dir}")
-    log.info(f"Done building {n_written:,} bhavcopy file(s) under {bhav_dir}")
+    log.info(f"Done building {n_written:,} bhavcopy file(s) under {out_root}/<EXCHANGE>/bhavcopy")
 
 
 def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
                         date_format: str = None, tickers=None, exchange_map=None,
-                        metastock_ascii: bool = False):
+                        metastock_ascii: bool = False, price_basis: str = "split",
+                        include_delisted: bool = False):
     """Club every ticker's data across the whole date range into ONE CSV.
 
     Default columns: Symbol,Date,Open,High,Low,Close,Volume, sorted by Date
@@ -1077,7 +1178,8 @@ def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
     or --layout per-symbol instead.
     """
     log.info("Building combined single CSV from cached ticker files...")
-    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map)
+    combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map,
+                                price_basis=price_basis, include_delisted=include_delisted)
     if combined is None:
         log.warning("No data found to build the combined CSV from.")
         return
@@ -1091,7 +1193,8 @@ def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
 
 def build_per_symbol_csvs(raw_dir: Path, out_dir: Path, start: str, end: str,
                            date_format: str = None, tickers=None, exchange_map=None,
-                           metastock_ascii: bool = False):
+                           metastock_ascii: bool = False, price_basis: str = "split",
+                           include_delisted: bool = False):
     """Alternative layout: one CSV per symbol (classic Metastock ASCII import).
     Files are named after the output symbol: exchange-prefixed by default
     (NASDAQ.AAPL.csv), the bare MetaStock symbol with metastock_ascii."""
@@ -1099,8 +1202,27 @@ def build_per_symbol_csvs(raw_dir: Path, out_dir: Path, start: str, end: str,
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
 
+    if include_delisted:
+        # renamed symbols are joined across files, so go through the merged table
+        combined = _load_raw_frames(raw_dir, start, end, tickers, exchange_map,
+                                    price_basis=price_basis, include_delisted=True)
+        if combined is None:
+            log.warning("No data found to build per-symbol CSVs from.")
+            return
+        groups = list(combined.groupby("Ticker"))
+        progress = _ProgressLog("Per-symbol CSVs", len(groups))
+        for _, df in groups:
+            progress.step()
+            out = _format_output(df, metastock_ascii, date_format, exchange_map, sort_by=("Date",))
+            _write_csv(out, out_dir / f"{out['Symbol'].iloc[0]}.csv", metastock_ascii)
+        log.info(f"Wrote per-symbol CSVs to {out_dir}")
+        return
+
     raw_files = _select_raw_files(raw_dir, tickers, exchange_map)
+    log.info(f"Writing per-symbol CSVs for {len(raw_files):,} ticker(s) to {out_dir} ...")
+    progress = _ProgressLog("Per-symbol CSVs", len(raw_files))
     for f in raw_files:
+        progress.step()
         try:
             df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
         except Exception:
@@ -1113,6 +1235,7 @@ def build_per_symbol_csvs(raw_dir: Path, out_dir: Path, start: str, end: str,
             continue
         if "Ticker" not in df.columns:
             df["Ticker"] = _bare_ticker_from_filename(f.stem)
+        df = _apply_basis(df, f, raw_dir, price_basis)
         # In MetaStock mode the symbol is the bare ticker -- MetaStock needs it
         # to match your existing security codes; "NASDAQ.AAPL" would look like
         # an unrelated new symbol.
@@ -1161,7 +1284,7 @@ def parse_args():
                          "any exchange. Needs a Symbol column (a Name column is optional). Use "
                          "with --exchanges to say which exchange these tickers belong to, e.g. "
                          "--ticker-file bse_list.csv --exchanges BSE")
-    p.add_argument("--output", default="./market_data", help="Output root folder")
+    p.add_argument("--output", default="./market_data_daily", help="Output root folder")
     p.add_argument("--layout", choices=["daily", "per-symbol", "combined", "all"], default="daily",
                     help="Output layout: one file per day, one per symbol, one single "
                          "clubbed CSV with everything, or all three")
@@ -1188,11 +1311,9 @@ def parse_args():
                          "<TICKER>,<PER>,<DTYYYYMMDD>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>, bare "
                          "ticker, Period 'D', YYYYMMDD dates -- what MetaStock's Downloader "
                          "converts directly. Applies to whichever --layout you've chosen.")
-    p.add_argument("--split-by-exchange", action="store_true",
-                    help="Download and build output into separate NASDAQ/ and NYSE/ subfolders "
-                         "under --output, each with its own raw/ cache and its own daily/by_symbol/"
-                         "combined output -- rather than one shared set of folders with both "
-                         "exchanges mixed together.")
+    # Output is always split into <output>/<EXCHANGE>/ now; the old flag is
+    # still accepted so existing scripts/shortcuts don't break.
+    p.add_argument("--split-by-exchange", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--bse-source", choices=["yahoo", "bhavcopy"], default="yahoo",
                     help="Where BSE tickers' prices come from. 'yahoo' (default) is quick but "
                          "Yahoo's BSE data is patchy (empty/sparse BSE tickers fall back to the "
@@ -1201,17 +1322,29 @@ def parse_args():
                          "per trading day (cached under <output>/bhavcopy_cache) so a first "
                          "10-year run takes a while.")
     p.add_argument("--no-bhavcopy", action="store_true",
-                    help="Don't write the per-day bhavcopy files (<output>/bhavcopy/<EXCHANGE>/"
+                    help="Don't write the per-day bhavcopy files (<output>/<EXCHANGE>/bhavcopy/"
                          "<EXCHANGE>_YYYYMMDD.csv, MetaStock ASCII, every stock for that day). "
                          "They're built after every run by default, whatever --layout is.")
     p.add_argument("--no-split-adjust", action="store_true",
                     help="With --bse-source bhavcopy: leave prices unadjusted for splits/bonuses "
                          "(default adjusts them using Yahoo's corporate-actions data).")
-    return p.parse_args()
+    p.add_argument("--price-basis", choices=["split", "raw"], default="split",
+                   help="'split' (default) = Yahoo's prices, already adjusted for later splits/"
+                        "bonuses/rights. 'raw' = as-traded prices, rebuilt with the per-date scale "
+                        "factors in <EX>/recon/scale_factors.csv (NSE only; run nse_factors.py "
+                        "first). Raw-basis output goes to daily_raw/, by_symbol_raw/, combined_raw/ "
+                        "and bhavcopy_raw/ so it never overwrites the adjusted files.")
+    p.add_argument("--include-delisted", action="store_true",
+                   help="With --price-basis raw: also include NSE symbols from <EX>/raw_delisted/ "
+                        "(delisted/merged names, as-traded; made by nse_delisted.py).")
+    args = p.parse_args()
+    if args.include_delisted and args.price_basis != "raw":
+        p.error("--include-delisted requires --price-basis raw")
+    return args
 
 
 def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_dir, combined_path,
-                        bhavcopy_dir, args):
+                        out_root, args):
     """Runs the full download -> build pipeline for one set of tickers into
     one set of directories. Building only happens once, after every
     download in this batch has finished -- not incrementally per-ticker."""
@@ -1226,21 +1359,28 @@ def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_di
     # Pass `tickers` through explicitly so the output only reflects what was
     # requested this run (e.g. a single --ticker, or a --limit'ed test run)
     # rather than everything that happens to be cached in raw_dir already.
+    basis = dict(price_basis=args.price_basis, include_delisted=args.include_delisted)
+    if args.price_basis == "raw":
+        # keep as-traded output apart from the adjusted files
+        daily_dir = daily_dir.with_name(daily_dir.name + "_raw")
+        per_symbol_dir = per_symbol_dir.with_name(per_symbol_dir.name + "_raw")
+        combined_path = combined_path.parent.with_name(combined_path.parent.name + "_raw") / combined_path.name
     if args.layout in ("daily", "all"):
         build_daily_csvs(raw_dir, daily_dir, args.start, args.end, args.date_format,
                           tickers=tickers, exchange_map=exchange_map,
-                          metastock_ascii=args.metastock_ascii)
+                          metastock_ascii=args.metastock_ascii, **basis)
     if args.layout in ("per-symbol", "all"):
         build_per_symbol_csvs(raw_dir, per_symbol_dir, args.start, args.end, args.date_format,
                                tickers=tickers, exchange_map=exchange_map,
-                               metastock_ascii=args.metastock_ascii)
+                               metastock_ascii=args.metastock_ascii, **basis)
     if args.layout in ("combined", "all"):
         build_combined_csv(raw_dir, combined_path, args.start, args.end, args.date_format,
                             tickers=tickers, exchange_map=exchange_map,
-                            metastock_ascii=args.metastock_ascii)
+                            metastock_ascii=args.metastock_ascii, **basis)
     if not args.no_bhavcopy:
-        build_bhavcopy_files(raw_dir, bhavcopy_dir, args.start, args.end,
-                             tickers=tickers, exchange_map=exchange_map)
+        build_bhavcopy_files(raw_dir, out_root, args.start, args.end,
+                             tickers=tickers, exchange_map=exchange_map, **basis,
+                             folder="bhavcopy_raw" if args.price_basis == "raw" else "bhavcopy")
 
 
 def main():
@@ -1274,11 +1414,15 @@ def main():
                 args.exchanges, include_etfs=not args.no_etfs, cache_path=ticker_cache,
                 refresh=args.refresh_tickers,
             )
-        tickers = directory_df["Symbol"].tolist()
-        exchange_map = dict(zip(directory_df["Symbol"], directory_df["Exchange"]))
+        # A cached directory can hold more exchanges than were asked for, and the same symbol can exist on
+        # several (INFY, HAL ... on both NSE and NYSE). Keep only the requested exchanges and group by the
+        # directory's own Exchange column -- a symbol->exchange dict would let one listing shadow the other.
+        directory_df = directory_df[directory_df["Exchange"].isin(args.exchanges)].drop_duplicates(
+            ["Symbol", "Exchange"])
         if args.limit:
-            tickers = tickers[: args.limit]
+            directory_df = directory_df.head(args.limit)
             log.info(f"Limiting to first {args.limit} tickers for this run")
+        groups = {ex: sub["Symbol"].tolist() for ex, sub in directory_df.groupby("Exchange", sort=False)}
     else:
         tickers = [ticker_arg]
         log.info(f"Single ticker mode: {ticker_arg}")
@@ -1291,24 +1435,23 @@ def main():
                       f"suffix to find it at all, not just for display) -- pass "
                       f"--ticker-exchange, e.g. NSE, LSE, HKEX (see --help for the full list).")
 
-    if args.split_by_exchange:
-        groups = {}
-        for t in tickers:
-            groups.setdefault(exchange_map.get(t, "UNKNOWN"), []).append(t)
-        for ex, ex_tickers in groups.items():
-            log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
-            ex_dir = out_root / ex
-            ex_exchange_map = {t: exchange_map.get(t) for t in ex_tickers}
-            _download_and_build(
-                ex_tickers, ex_exchange_map,
-                ex_dir / "raw", ex_dir / "daily", ex_dir / "by_symbol",
-                ex_dir / "combined" / "all_data.csv", out_root / "bhavcopy", args,
-            )
-    else:
+    # Every exchange gets its own folder: <output>/<EXCHANGE>/{raw,daily,
+    # by_symbol,combined,bhavcopy}. Tickers with no known exchange go to UNKNOWN/.
+    if ticker_arg != "ALL":
+        groups = {exchange_map.get(ticker_arg) or "UNKNOWN": [ticker_arg]}
+    if args.price_basis == "raw":
+        others = sorted(set(groups) - _pb.FACTOR_EXCHANGES)
+        if others:
+            log.warning(f"--price-basis raw has scale factors for {sorted(_pb.FACTOR_EXCHANGES)} only; "
+                        f"{others} will be written unchanged (still Yahoo's adjusted prices).")
+    for ex, ex_tickers in groups.items():
+        log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
+        ex_dir = out_root / ex
+        ex_exchange_map = {t: (None if ex == "UNKNOWN" else ex) for t in ex_tickers}
         _download_and_build(
-            tickers, exchange_map,
-            out_root / "raw", out_root / "daily", out_root / "by_symbol",
-            out_root / "combined" / "all_data.csv", out_root / "bhavcopy", args,
+            ex_tickers, ex_exchange_map,
+            ex_dir / "raw", ex_dir / "daily", ex_dir / "by_symbol",
+            ex_dir / "combined" / "all_data.csv", out_root, args,
         )
 
     log.info("All done.")

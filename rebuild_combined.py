@@ -1,8 +1,9 @@
 """
 rebuild_combined.py
 --------------------
-Rebuilds market_data/combined/all_data.csv from whatever is already cached
-in market_data/raw/ -- no network access, no re-download.
+Rebuilds <EXCHANGE>/combined/all_data.csv from whatever is already cached
+in <EXCHANGE>/raw/ under market_data_daily/ -- for every exchange folder
+found, or just --exchange -- with no network access, no re-download.
 
 Reimplements build_combined_csv()'s per-file loop locally (rather than
 calling it as a black box) purely so progress/ETA can be reported as each
@@ -12,7 +13,8 @@ eod_downloader.py helpers, so output is identical to the original
 function's.
 
 Usage:
-    python rebuild_combined.py
+    python rebuild_combined.py                      # every exchange folder under --root
+    python rebuild_combined.py --exchange NSE
     python rebuild_combined.py --start 2015-01-01 --end 2026-09-26
     python rebuild_combined.py --metastock-ascii
     python rebuild_combined.py --log-every 50
@@ -116,10 +118,15 @@ def rebuild_combined(raw_dir: Path, out_path: Path, start: str, end: str,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw-dir", default="./market_data/raw",
-                         help="Where the cached raw/<SYMBOL>.csv files live")
-    parser.add_argument("--out", default="./market_data/combined/all_data.csv",
-                         help="Output path for the combined CSV")
+    parser.add_argument("--root", default="./market_data_daily",
+                         help="Daily data root holding one <EXCHANGE>/raw/ folder per exchange")
+    parser.add_argument("--exchange", default=None,
+                         help="Only rebuild this exchange (e.g. NSE). Default: every exchange "
+                              "folder under --root that has a raw/ cache")
+    parser.add_argument("--raw-dir", default=None,
+                         help="Explicit raw/ folder (overrides --root/--exchange; needs --out)")
+    parser.add_argument("--out", default=None,
+                         help="Output path for the combined CSV when --raw-dir is given")
     parser.add_argument("--start", default="2000-01-01",
                          help="Earliest date to include (YYYY-MM-DD). Wide by default "
                               "so nothing cached gets filtered out unintentionally.")
@@ -141,21 +148,31 @@ def main():
     log = logging.getLogger("rebuild_combined")
 
     end = args.end or dt.date.today().strftime("%Y-%m-%d")
-    raw_dir = Path(args.raw_dir)
-    out_path = Path(args.out)
+    if args.raw_dir:
+        if not args.out:
+            raise SystemExit("--raw-dir needs --out")
+        jobs = [(Path(args.raw_dir), Path(args.out))]
+    else:
+        root = Path(args.root)
+        ex_dirs = [root / args.exchange.upper()] if args.exchange else sorted(
+            p for p in root.iterdir() if (p / "raw").is_dir())
+        jobs = [(d / "raw", d / "combined" / "all_data.csv") for d in ex_dirs]
+    if not jobs:
+        raise SystemExit(f"No <EXCHANGE>/raw/ folders found under {Path(args.root).resolve()}")
 
-    if not raw_dir.exists():
-        raise SystemExit(f"raw_dir not found: {raw_dir.resolve()}")
-
-    rebuild_combined(
-        raw_dir=raw_dir,
-        out_path=out_path,
-        start=args.start,
-        end=end,
-        metastock_ascii=args.metastock_ascii,
-        log_every=max(1, args.log_every),
-        log=log,
-    )
+    for raw_dir, out_path in jobs:
+        if not raw_dir.exists():
+            raise SystemExit(f"raw_dir not found: {raw_dir.resolve()}")
+        log.info(f"=== {raw_dir.parent.name}: {raw_dir} -> {out_path} ===")
+        rebuild_combined(
+            raw_dir=raw_dir,
+            out_path=out_path,
+            start=args.start,
+            end=end,
+            metastock_ascii=args.metastock_ascii,
+            log_every=max(1, args.log_every),
+            log=log,
+        )
 
 
 if __name__ == "__main__":

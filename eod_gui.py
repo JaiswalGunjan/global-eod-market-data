@@ -63,6 +63,7 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 
 import eod_downloader as core  # reuse all download/build logic
+import hourly_downloader as hourly  # 1h bars (NSE/NASDAQ/NYSE, Yahoo's ~730-day window)
 
 try:
     from tkcalendar import DateEntry
@@ -380,12 +381,25 @@ class MarketDataGUI(tk.Tk):
             ("Single combined file", "combined"),
             ("All of the above", "all"),
         ]
+        interval_row = ttk.Frame(layout_frame)
+        interval_row.pack(fill="x")
+        ttk.Label(interval_row, text="Data interval:").pack(side="left", padx=(8, 4), pady=(8, 2))
+        self.interval_var = tk.StringVar(value="daily")
+        ttk.Radiobutton(interval_row, text="Daily", variable=self.interval_var, value="daily",
+                        command=self._on_interval_change).pack(side="left", padx=8, pady=(8, 2))
+        ttk.Radiobutton(interval_row, text="Hourly (NSE/NASDAQ/NYSE, last ~2 years)",
+                        variable=self.interval_var, value="hourly",
+                        command=self._on_interval_change).pack(side="left", padx=8, pady=(8, 2))
+        self.interval_note_var = tk.StringVar(value="")
+        ttk.Label(layout_frame, textvariable=self.interval_note_var, foreground="#a15c00",
+                  wraplength=900, justify="left").pack(anchor="w", padx=8)
         radio_row = ttk.Frame(layout_frame)
         radio_row.pack(fill="x")
+        self.layout_radios = []
         for text, val in options:
-            ttk.Radiobutton(radio_row, text=text, variable=self.layout_var, value=val).pack(
-                side="left", padx=8, pady=(8, 2)
-            )
+            rb = ttk.Radiobutton(radio_row, text=text, variable=self.layout_var, value=val)
+            rb.pack(side="left", padx=8, pady=(8, 2))
+            self.layout_radios.append(rb)
         self.metastock_ascii_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             layout_frame,
@@ -393,22 +407,25 @@ class MarketDataGUI(tk.Tk):
             variable=self.metastock_ascii_var,
         ).pack(anchor="w", padx=8, pady=(2, 2))
         self.bhavcopy_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.bhavcopy_check = ttk.Checkbutton(
             layout_frame,
-            text="Also write per-day bhavcopy files for MetaStock (bhavcopy/<EXCHANGE>/<EXCHANGE>_YYYYMMDD.csv)",
+            text="Also write per-day bhavcopy files for MetaStock (<EXCHANGE>/bhavcopy/<EXCHANGE>_YYYYMMDD.csv)",
             variable=self.bhavcopy_var,
-        ).pack(anchor="w", padx=8, pady=(2, 2))
-        self.split_by_exchange_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        )
+        self.bhavcopy_check.pack(anchor="w", padx=8, pady=(2, 2))
+        ttk.Label(
             layout_frame,
-            text="Split into separate NASDAQ/ and NYSE/ folders (each with its own raw + combined output)",
-            variable=self.split_by_exchange_var,
+            text="Data is always saved per exchange: <save location>/<EXCHANGE>/ (e.g. NSE/, NASDAQ/, NYSE/)",
         ).pack(anchor="w", padx=8, pady=(2, 8))
 
         # 5. Save location
         out_frame = ttk.LabelFrame(body, text="5. Save location")
         out_frame.pack(fill="x", **pad)
-        self.output_var = tk.StringVar(value=str(Path.cwd() / "market_data"))
+        # One save location per interval (swapped by _on_interval_change), so
+        # daily and hourly data never land in the same folder.
+        self.output_paths = {"daily": str(Path.cwd() / "market_data_daily"),
+                             "hourly": str(Path.cwd() / "market_data_hourly")}
+        self.output_var = tk.StringVar(value=self.output_paths["daily"])
         ttk.Entry(out_frame, textvariable=self.output_var).pack(
             side="left", padx=(10, 6), pady=8, fill="x", expand=True
         )
@@ -472,14 +489,43 @@ class MarketDataGUI(tk.Tk):
             "end": end_s,
             "end_is_today": end_s == today_str,  # so a saved "today" doesn't go stale
             "layout": self.layout_var.get(),
+            "interval": self.interval_var.get(),
             "metastock_ascii": self.metastock_ascii_var.get(),
             "bhavcopy": self.bhavcopy_var.get(),
-            "split_by_exchange": self.split_by_exchange_var.get(),
             "bse_bhavcopy": self.bse_bhavcopy_var.get(),
             "bse_adjust": self.bse_adjust_var.get(),
-            "output": self.output_var.get(),
+            "output": self._current_output_paths()["daily"],
+            "output_hourly": self._current_output_paths()["hourly"],
             "size": [self.winfo_width(), self.winfo_height()],
         }
+
+    def _on_interval_change(self):
+        """Hourly mode writes its own per-hour files (no daily/combined/
+        bhavcopy), so grey those out, say what the hourly limits are,
+        and swap the save location to that interval's folder."""
+        hourly_mode = self.interval_var.get() == "hourly"
+        new = self.interval_var.get()
+        shown = getattr(self, "_shown_interval", new)  # interval whose folder the field shows now
+        if shown != new and self.output_var.get().strip():
+            self.output_paths[shown] = self.output_var.get().strip()
+        self._shown_interval = new
+        self.output_var.set(self.output_paths[new])
+        state = "disabled" if hourly_mode else "normal"
+        for w in (*self.layout_radios, self.bhavcopy_check):
+            w.config(state=state)
+        self.interval_note_var.set(
+            "Hourly: Yahoo only has the last ~730 days of 1h bars. Output goes to "
+            "<save location>/<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv (all tickers for one hour per "
+            "file). Re-run regularly -- each run "
+            "appends new bars, so the cached history grows past 2 years. Only NSE, NASDAQ and NYSE "
+            "tickers are downloaded." if hourly_mode else "")
+
+    def _current_output_paths(self) -> dict:
+        """output_paths with the field's (possibly just edited) value applied."""
+        paths = dict(self.output_paths)
+        if self.output_var.get().strip():
+            paths[getattr(self, "_shown_interval", self.interval_var.get())] = self.output_var.get().strip()
+        return paths
 
     def _save_settings(self):
         try:
@@ -502,13 +548,17 @@ class MarketDataGUI(tk.Tk):
             end = date.today() if s.get("end_is_today") else datetime.strptime(s["end"], "%Y-%m-%d").date()
             self._set_dates(start, end)
             self.layout_var.set(s.get("layout", "combined"))
+            self.interval_var.set(s.get("interval", "daily"))
+            self._on_interval_change()
             self.metastock_ascii_var.set(bool(s.get("metastock_ascii", False)))
             self.bhavcopy_var.set(bool(s.get("bhavcopy", True)))
-            self.split_by_exchange_var.set(bool(s.get("split_by_exchange", False)))
             self.bse_bhavcopy_var.set(bool(s.get("bse_bhavcopy", False)))
             self.bse_adjust_var.set(bool(s.get("bse_adjust", True)))
             if s.get("output"):
-                self.output_var.set(s["output"])
+                self.output_paths["daily"] = s["output"]
+            if s.get("output_hourly"):
+                self.output_paths["hourly"] = s["output_hourly"]
+            self.output_var.set(self.output_paths[self.interval_var.get()])
             if s.get("size"):
                 w = min(int(s["size"][0]), self.winfo_screenwidth() - 40)
                 h = min(int(s["size"][1]), self.winfo_screenheight() - 80)
@@ -895,7 +945,7 @@ class MarketDataGUI(tk.Tk):
             messagebox.showerror("Invalid date range", "Start date must be before end date.")
             return
 
-        output_dir = Path(self.output_var.get().strip() or (Path.cwd() / "market_data"))
+        output_dir = Path(self.output_var.get().strip() or self.output_paths[self.interval_var.get()])
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -903,8 +953,16 @@ class MarketDataGUI(tk.Tk):
             return
 
         layout = self.layout_var.get()
+        interval = self.interval_var.get()
+        if interval == "hourly":
+            chosen = markets if all_mode else set(exchange_snapshot.values())
+            if not set(chosen) & set(hourly.HOURLY_EXCHANGES):
+                messagebox.showwarning(
+                    "Hourly not available",
+                    "Hourly data is only available for NSE, NASDAQ and NYSE. "
+                    "Select one of those markets (or tickers from them).")
+                return
         metastock_ascii = self.metastock_ascii_var.get()
-        split_by_exchange = self.split_by_exchange_var.get()
         bse_source = "bhavcopy" if self.bse_bhavcopy_var.get() else "yahoo"
         bse_adjust = self.bse_adjust_var.get()
         self.write_bhavcopy = self.bhavcopy_var.get()  # snapshot: worker thread must not read Tk vars
@@ -916,34 +974,45 @@ class MarketDataGUI(tk.Tk):
         ticker_desc = "ALL" if ticker_selection == "ALL" else f"{len(ticker_selection)} selected"
         self._append_log(
             f"--- Starting run | markets={markets or '(n/a, specific tickers)'} | "
-            f"tickers={ticker_desc} | {start_s} -> {end_s} | layout={layout} | "
-            f"metastock_ascii={metastock_ascii} | split_by_exchange={split_by_exchange} | "
+            f"tickers={ticker_desc} | {start_s} -> {end_s} | interval={interval} | layout={layout} | "
+            f"metastock_ascii={metastock_ascii} | "
             f"output={output_dir} ---"
         )
 
+        if interval == "hourly":
+            threading.Thread(
+                target=self._run_hourly_worker,
+                args=(markets, ticker_selection, exchange_snapshot, start_s, end_s, output_dir,
+                      metastock_ascii),
+                daemon=True,
+            ).start()
+            return
         threading.Thread(
             target=self._run_download_worker,
             args=(markets, ticker_selection, exchange_snapshot, start_s, end_s, output_dir,
-                  layout, metastock_ascii, split_by_exchange, bse_source, bse_adjust),
+                  layout, metastock_ascii, bse_source, bse_adjust),
             daemon=True,
         ).start()
 
     def _run_download_worker(self, markets, ticker_selection, exchange_snapshot,
                               start_s, end_s, output_dir, layout, metastock_ascii,
-                              split_by_exchange, bse_source="yahoo", bse_adjust=True):
+                              bse_source="yahoo", bse_adjust=True):
         try:
             core.start_file_logging(output_dir)
             exchange_map = {}
 
+            groups = None
             if ticker_selection == "ALL":
-                tickers = set()
+                # One group per market, straight from that market's own directory: the same symbol can
+                # be listed on several (INFY/HAL on NSE and NYSE) and a symbol->exchange dict would let
+                # one listing shadow the other.
+                groups = {}
                 for m in markets:
                     cache_path = CACHE_DIR / f"{m.lower()}_tickers.csv"
                     df = core.fetch_ticker_directory([m], include_etfs=True, cache_path=cache_path,
                                                        refresh=False)
-                    tickers.update(df["Symbol"].tolist())
-                    exchange_map.update(dict(zip(df["Symbol"], df["Exchange"])))
-                tickers = sorted(tickers)
+                    groups[m] = sorted(set(df.loc[df["Exchange"] == m, "Symbol"]))
+                tickers = sorted({t for g in groups.values() for t in g})
             else:
                 tickers = list(ticker_selection)
                 for t in tickers:
@@ -961,35 +1030,26 @@ class MarketDataGUI(tk.Tk):
             if not tickers:
                 raise RuntimeError("No tickers resolved for the selected market(s)/ticker(s).")
 
-            if split_by_exchange:
-                # Separate raw/ cache AND separate combined/daily/per-symbol
-                # output per exchange, e.g. output_dir/NASDAQ/..., output_dir/NYSE/...
+            # Always one folder per exchange: output_dir/<EXCHANGE>/{raw,daily,
+            # by_symbol,combined,bhavcopy}. Unknown-exchange tickers go to UNKNOWN/.
+            if groups is None:
                 groups = {}
                 for t in tickers:
-                    groups.setdefault(exchange_map.get(t, "UNKNOWN"), []).append(t)
-                for ex, ex_tickers in groups.items():
-                    core.log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
-                    ex_dir = output_dir / ex
-                    ex_exchange_map = {t: exchange_map.get(t) for t in ex_tickers}
-                    core.download_all(ex_tickers, start_s, end_s, ex_dir / "raw", pause=0.3,
-                                       progress_callback=self._on_progress,
-                                       exchange_map=ex_exchange_map, max_workers=10,
-                                       cancel_event=self.cancel_event,
-                                       bse_source=bse_source, bse_adjust_splits=bse_adjust)
-                    if self.cancel_event.is_set():
-                        break
-                    core.report_data_quality(ex_dir / "raw", ex_tickers, ex_exchange_map)
-                    self._build_outputs(ex_dir, ex_tickers, ex_exchange_map, layout, metastock_ascii,
-                                         start_s, end_s, output_dir / "bhavcopy")
-            else:
-                core.download_all(tickers, start_s, end_s, output_dir / "raw", pause=0.3,
-                                   progress_callback=self._on_progress, exchange_map=exchange_map,
-                                   max_workers=10, cancel_event=self.cancel_event,
+                    groups.setdefault(exchange_map.get(t) or "UNKNOWN", []).append(t)
+            for ex, ex_tickers in groups.items():
+                core.log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
+                ex_dir = output_dir / ex
+                ex_exchange_map = {t: (None if ex == "UNKNOWN" else ex) for t in ex_tickers}
+                core.download_all(ex_tickers, start_s, end_s, ex_dir / "raw", pause=0.3,
+                                   progress_callback=self._on_progress,
+                                   exchange_map=ex_exchange_map, max_workers=10,
+                                   cancel_event=self.cancel_event,
                                    bse_source=bse_source, bse_adjust_splits=bse_adjust)
-                if not self.cancel_event.is_set():
-                    core.report_data_quality(output_dir / "raw", tickers, exchange_map)
-                    self._build_outputs(output_dir, tickers, exchange_map, layout, metastock_ascii,
-                                         start_s, end_s, output_dir / "bhavcopy")
+                if self.cancel_event.is_set():
+                    break
+                core.report_data_quality(ex_dir / "raw", ex_tickers, ex_exchange_map)
+                self._build_outputs(ex_dir, ex_tickers, ex_exchange_map, layout, metastock_ascii,
+                                     start_s, end_s, output_dir)
 
             if self.cancel_event.is_set():
                 self.after(0, self._download_finished, "cancelled",
@@ -1002,8 +1062,53 @@ class MarketDataGUI(tk.Tk):
             core.log.error(f"GUI run failed: {e}")
             self.after(0, self._download_finished, "error", str(e))
 
+    def _run_hourly_worker(self, markets, ticker_selection, exchange_snapshot,
+                           start_s, end_s, output_dir, metastock_ascii):
+        try:
+            core.start_file_logging(output_dir)
+            pairs = []
+            if ticker_selection == "ALL":
+                for m in markets:
+                    if m not in hourly.HOURLY_EXCHANGES:
+                        core.log.warning(f"Hourly data isn't supported for {m}; skipping it.")
+                        continue
+                    df = core.fetch_ticker_directory([m], include_etfs=True,
+                                                     cache_path=CACHE_DIR / f"{m.lower()}_tickers.csv",
+                                                     refresh=False)
+                    df = df[df["Exchange"] == m]
+                    pairs += [(str(s), m) for s in df["Symbol"].dropna()]
+            else:
+                for t in ticker_selection:
+                    ex = exchange_snapshot.get(t)
+                    if ex in hourly.HOURLY_EXCHANGES:
+                        pairs.append((t, ex))
+                    else:
+                        core.log.warning(f"Skipping {t}: hourly data needs a known NSE/NASDAQ/NYSE "
+                                         f"ticker (exchange: {ex or 'unknown'}).")
+            if not pairs:
+                raise RuntimeError("No NSE/NASDAQ/NYSE tickers to download hourly data for.")
+
+            hourly_dir = output_dir
+            hourly.download_all_hourly(pairs, hourly_dir, workers=8,
+                                       progress_callback=self._on_progress,
+                                       cancel_event=self.cancel_event)
+            if not self.cancel_event.is_set():
+                hourly.build_hour_files(pairs, hourly_dir, metastock_ascii, start_s, end_s)
+
+            if self.cancel_event.is_set():
+                self.after(0, self._download_finished, "cancelled",
+                           f"Cancelled. Finished tickers are cached under:\n{hourly_dir}\n"
+                           f"Re-run the same settings later to resume.")
+            else:
+                self.after(0, self._download_finished, "success",
+                           f"Done -- hourly data for {len(pairs):,} ticker(s).\nSaved under:\n"
+                           f"{hourly_dir}")
+        except Exception as e:
+            core.log.error(f"GUI hourly run failed: {e}")
+            self.after(0, self._download_finished, "error", str(e))
+
     def _build_outputs(self, base_dir, tickers, exchange_map, layout, metastock_ascii, start_s, end_s,
-                       bhavcopy_dir):
+                       output_root):
         """Runs once, after all downloads for `tickers` have finished -- never
         incrementally per-ticker, so combining a big batch only happens once."""
         raw_dir = base_dir / "raw"
@@ -1020,7 +1125,7 @@ class MarketDataGUI(tk.Tk):
                                      tickers=tickers, exchange_map=exchange_map,
                                      metastock_ascii=metastock_ascii)
         if self.write_bhavcopy:
-            core.build_bhavcopy_files(raw_dir, bhavcopy_dir, start_s, end_s,
+            core.build_bhavcopy_files(raw_dir, output_root, start_s, end_s,
                                       tickers=tickers, exchange_map=exchange_map)
 
     def _on_progress(self, done, total, failed, no_data):
@@ -1029,7 +1134,8 @@ class MarketDataGUI(tk.Tk):
     def _update_progress_ui(self, done, total, failed, no_data):
         self.progress["maximum"] = max(total, 1)
         self.progress["value"] = done
-        self.status_var.set(f"{done}/{total} | failed={failed} | no_data={no_data}")
+        pct = 100 * done / total if total else 100
+        self.status_var.set(f"{pct:.1f}% | {done}/{total} | failed={failed} | no_data={no_data}")
 
     def _download_finished(self, status: str, message: str):
         self._set_running_state(False)

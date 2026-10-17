@@ -75,15 +75,19 @@ A window opens with:
    `tkcalendar` isn't installed** — run `pip install tkcalendar` and
    restart the app; the plain text fields still work fine in the meantime,
    they're just less convenient.
-4. **CSV layout** — single combined file (default), one file per day, one
-   per symbol, or all three, plus two checkboxes:
+4. **CSV layout** — **Data interval** (Daily or Hourly), then single combined
+   file (default), one file per day, one per symbol, or all three, plus:
    - **Strict MetaStock ASCII format** — check this if you're actually
      importing into MetaStock (see [section 4](#4-about-the-metastock-format))
-   - **Split into separate NASDAQ/ and NYSE/ folders** — each exchange gets
-     its own `raw/` cache and its own `daily/`/`by_symbol/`/`combined/`
-     output, instead of one shared set of folders with both mixed together
+   - Data is always saved per exchange: each exchange gets its own
+     `<save location>/<EXCHANGE>/` folder with its own `raw/` cache and
+     `daily/`/`by_symbol/`/`combined/`/`bhavcopy/` output
+   - **Hourly** (NSE/NASDAQ/NYSE only, last ~2 years from Yahoo) writes one
+     file per exchange per hour, `<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv`,
+     with every ticker's bar for that hour (see `hourly_downloader.py`)
 5. **Save location** — any folder, via Browse; **Open folder** jumps there
-   once files exist
+   once files exist. Daily and Hourly each remember their own folder
+   (defaults `market_data_daily` and `market_data_hourly`)
 
 Hit **Download**. Progress, ETA, and any errors stream into the log box at
 the bottom — it's the same information you'd see in the console when running
@@ -167,13 +171,12 @@ Or point at a CSV you've exported yourself, if the automatic fetch ever fails:
 python eod_downloader.py --exchanges BSE --ticker-file bse_list.csv --layout combined
 ```
 
-NASDAQ and NYSE downloaded and combined separately, each into its own folder
-(`market_data/NASDAQ/...` and `market_data/NYSE/...`, each with its own
-`raw/` cache and its own single combined file) -- works the same way for
-any combination of exchanges, e.g. `--exchanges NSE BSE --split-by-exchange`:
+Every exchange is always downloaded into its own folder
+(`market_data_daily/NASDAQ/...`, `market_data_daily/NYSE/...`, each with its own
+`raw/` cache and its own combined file) -- for any combination of exchanges:
 
 ```bash
-python eod_downloader.py --split-by-exchange --layout combined
+python eod_downloader.py --exchanges NSE BSE --layout combined
 ```
 
 Downloads run 10 at a time in parallel by default; dial it up/down if
@@ -277,46 +280,44 @@ python eod_downloader.py --exchanges BSE --bse-source bhavcopy --no-split-adjust
 ## 3. Output layout
 
 ```
-market_data/
-├── tickers.csv              # the ticker list used
-├── raw/                     # one cache file per ticker (download cache, keep this)
-│   ├── NASDAQ.AAPL.csv          # named with the exchange prefix when known
-│   ├── NASDAQ.MSFT.csv
-│   ├── NYSE.GE.csv
-│   └── ...
-├── daily/                   # one file per trading day
-│   ├── 20160115.csv
-│   ├── 20160119.csv
-│   └── ...
-├── by_symbol/                # optional, see "Metastock format" below
-├── combined/
-│   └── all_data.csv          # optional: every ticker + every date in ONE file
-└── bhavcopy/                 # always built (unless --no-bhavcopy), MetaStock ASCII
-    ├── NSE/NSE_20240102.csv      # one file per exchange per trading day,
-    ├── NYSE/NYSE_20240102.csv    # every downloaded stock for that day
-    └── ...
+market_data_daily/
+├── tickers.csv                  # the ticker list used
+├── logs/                        # one log file per run
+├── NASDAQ/
+│   ├── raw/                     # one cache file per ticker (download cache, keep this)
+│   │   ├── NASDAQ.AAPL.csv
+│   │   └── ...
+│   ├── daily/                   # one file per trading day (NASDAQ tickers only)
+│   │   ├── 20160115.csv
+│   │   └── ...
+│   ├── by_symbol/               # optional, see "Metastock format" below
+│   ├── combined/all_data.csv    # optional: every NASDAQ ticker + date in ONE file
+│   └── bhavcopy/                # always built (unless --no-bhavcopy), MetaStock ASCII
+│       ├── NASDAQ_20240102.csv  # every downloaded stock for that day
+│       └── ...
+├── NYSE/                        # same structure
+└── NSE/                         # same structure
 ```
 
 `bhavcopy/` mirrors the BSE/NSE bhavcopy idea for every exchange: each day's
 file holds all stocks for that day, already in MetaStock ASCII format, so you
 can point MetaStock's Downloader at a folder and convert day by day. It
 accumulates across runs -- downloading one more stock adds/updates just that
-stock in each existing day file and keeps everything else. With
-`--split-by-exchange` it still lives at the top level (`market_data/bhavcopy/`).
+stock in each existing day file and keeps everything else.
 Turn it off with `--no-bhavcopy` (CLI) or the checkbox in the GUI.
 
-Or, with `--split-by-exchange`:
+Hourly data (`hourly_downloader.py`, or Hourly in the GUI) uses the same
+per-exchange idea under `market_data_hourly/`:
 
 ```
-market_data/
-├── NASDAQ/
-│   ├── raw/{NASDAQ.AAPL.csv, NASDAQ.MSFT.csv, ...}
-│   ├── daily/, by_symbol/  (if requested)
-│   └── combined/all_data.csv   # NASDAQ tickers only
-└── NYSE/
-    ├── raw/{NYSE.GE.csv, NYSE.JPM.csv, ...}
-    ├── daily/, by_symbol/  (if requested)
-    └── combined/all_data.csv   # NYSE tickers only
+market_data_hourly/
+├── NSE/
+│   ├── raw_1h/NSE.TCS.csv ...   # download cache
+│   ├── NSE_20261009_0915.csv    # every NSE ticker's 09:15 bar that day
+│   ├── NSE_20261009_1015.csv
+│   └── ...
+├── NASDAQ/NASDAQ_20261009_0930.csv ...
+└── NYSE/NYSE_20261009_0930.csv ...
 ```
 
 Choose which of these get built with `--layout`:
@@ -332,10 +333,9 @@ python eod_downloader.py --layout all          # build all three at once
 ticker's OHLCV data across the entire date range, sorted by Date then Symbol.
 **Heads up**: for the full NYSE+NASDAQ universe over 10 years this can be a
 very large file (tens of millions of rows, likely 1GB+) — fine to generate,
-but worth knowing before you try to open it in Excel. `--split-by-exchange`
-naturally cuts this in half (one combined file per exchange instead of one
-file with both mixed together), which also happens to be the shape you'll
-want if MetaStock ends up needing NASDAQ and NYSE imported as separate
+but worth knowing before you try to open it in Excel. Because each exchange
+gets its own combined file, NASDAQ and NYSE are never mixed together, which
+is also the shape you'll want if MetaStock needs them imported as separate
 batches.
 
 Each `daily/YYYYMMDD.csv` looks like:
@@ -350,8 +350,7 @@ NYSE.GE,20160115,28.40,28.90,28.10,28.75,41000000
 
 `Symbol` is exchange-prefixed when the exchange is known — using each
 exchange's own standard name, the same one used everywhere else in this
-tool (`--exchanges` values, GUI checkboxes, `--split-by-exchange` folder
-names):
+tool (`--exchanges` values, GUI checkboxes, per-exchange folder names):
 
 | Exchange | Example         | Yahoo suffix (actual request) |
 |----------|-----------------|--------------------------------|
@@ -461,7 +460,7 @@ ticker download.
   hours, and Yahoo may occasionally throttle or return gaps. The script
   retries failed tickers a few times and logs any that still fail to
   `failed_tickers.txt` so you can re-run just those later.
-- **Survivorship bias**: the ticker list comes from today's live NASDAQ/NYSE
+- **Survivorship bias** (NSE can be fixed, see section 6): the ticker list comes from today's live NASDAQ/NYSE
   symbol directory, so companies that delisted or were acquired earlier in
   your 10-year window won't be included. Free sources generally can't avoid
   this — a paid EOD vendor (Polygon, Tiingo, EOD Historical Data, Norgate,
@@ -481,8 +480,7 @@ ticker download.
 - **Flaky exchange endpoints get retried**: NSE especially, and
   occasionally Nasdaq Trader, intermittently 403/timeout on a single
   request. Directory fetches now retry twice with backoff before giving up.
-- **Every run writes a log file** under `<output>/logs/run_<timestamp>.log`
-  (or `<output>/<EXCHANGE>/logs/...` with `--split-by-exchange`) — the full
+- **Every run writes a log file** under `<output>/logs/run_<timestamp>.log` — the full
   console/GUI log output, useful for checking what happened after a big
   overnight run.
 - **A quick data-quality check runs after every download**: if some
@@ -494,3 +492,54 @@ ticker download.
   "suspicious" by this measure even though its data is completely fine, so
   don't treat the warning as proof something's wrong, just as a hint of
   where to look first.
+
+## 6. Backtesting-grade NSE data (as-traded prices, delisted names, corporate actions)
+
+Yahoo's cached prices (`raw/`) are **retroactively adjusted** for later splits, bonuses and rights
+issues (e.g. HDFCBANK in 2016 shows ₹320 instead of the ₹1,282 that actually traded), and symbols
+that were delisted or merged away are missing. For NSE this can be corrected from NSE's official
+daily bhavcopy. Run the steps in order; all of them are offline-resumable (downloads are cached).
+
+| Step | Command | Output (under `<output>/NSE/`) |
+|---|---|---|
+| 1. Download official bhavcopies, backfill symbols Yahoo no longer serves | `python nse_delisted.py` | `official_cache/full/`, `raw_delisted/NSE.<SYM>.csv`, `raw_delisted/isin_map.csv` |
+| 2. Derive exact scale factors (Yahoo price → as-traded price) | `python nse_factors.py` | `recon/scale_factors.csv`, `factor_outliers.csv`, `factor_check.csv` |
+| 3. Validate rename chains (same ISIN, new symbol) | `python nse_stitch.py` | `raw_delisted/stitch_report.csv` |
+| 4. Build the corporate-actions table | `python nse_corporate_actions.py` | `corporate_actions.csv`, `recon/merger_check.csv` |
+| 5. Build as-traded output | `python eod_downloader.py --exchanges NSE --skip-download --price-basis raw --include-delisted --metastock-ascii --layout daily` | `daily_raw/`, `bhavcopy_raw/` (or `by_symbol_raw/`, `combined_raw/`) |
+
+(`reconcile_nse.py` is an optional diagnostic that samples ~quarterly dates and writes `recon/implied_factors.csv`,
+`suspicious.csv` and `missing_from_raw.csv`.)
+
+**Price bases.** `--price-basis split` (default) is Yahoo's adjusted prices. `--price-basis raw`
+applies `as_traded_price = yahoo_price × Factor` and `volume ÷ Factor` using `recon/scale_factors.csv`
+(NSE only; other exchanges are written unchanged with a warning). Raw-basis output goes to separate
+`*_raw` folders so it never overwrites the adjusted files. Against the official close, ~99.7% of
+symbols match within 0.5% (the rest is four-decimal factor rounding and the odd bad Yahoo bar).
+Dividend-adjusted (total-return) prices are **not** implemented.
+
+**Delisted names.** `--include-delisted` (needs `--price-basis raw`) adds `raw_delisted/` to the build.
+These are as-traded official prices, which is why they only mix with the raw basis. Symbols that kept
+the same ISIN under a new symbol (e.g. L&TFH → LTF) are joined into one series when
+`stitch_report.csv` says `Stitch=Y`; on overlapping dates NSE's official rows win over Yahoo's.
+The 29 rejected chains (very long gaps, i.e. relistings or reused ISINs) stay separate.
+
+**Corporate actions** (`corporate_actions.csv`: `Date,Symbol,Type,Ratio,NewSymbol,Source,Note`):
+`split_bonus` and `adjustment` (price steps that aren't clean split ratios: rights issues, demergers or
+bad data — review these) come from the factor steps; `rename` from the stitched chains; `delist` is a
+symbol's last traded day; `merger` comes from the hand-maintained **`nse_mergers.csv`**
+(`Old,New,Ratio,Note`; Ratio = new shares per old share; leave blank to use the ratio implied by prices).
+Mergers are events, not spliced series, because old and new usually trade side by side until the merger date.
+`recon/merger_check.csv` compares each declared ratio with the price-implied one and marks `REVIEW`
+when they differ by more than 5%. The seeded ratios were entered from memory of the scheme terms and are
+**not verified against the official scheme documents**; ALBK→INDIANB and GRUH→BANDHANBNK currently show `REVIEW`.
+
+**Keep it fresh.** Factors only reflect splits up to the last time `nse_factors.py` ran, so re-run steps 1–5
+after each daily update (step 1 only downloads the new days).
+
+**Same symbol on two exchanges.** Tickers are now grouped by the directory's `Exchange` column, so symbols listed
+on both NSE and NYSE (INFY, HAL, IEX …) are each downloaded under the right exchange. Before this fix the NYSE
+listing shadowed the NSE one and the NSE cache silently went stale.
+
+**Still missing:** BSE/US as-traded prices and corporate actions (no free official source for US delisted
+data), mergers where the ISIN changed beyond those in `nse_mergers.csv`, and total-return prices.

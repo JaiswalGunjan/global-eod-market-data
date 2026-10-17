@@ -3,4 +3,6 @@ venv/
 __pycache__/
 *.pyc
 market_data/
+market_data_daily/
+market_data_hourly/
 .ticker_cache/
