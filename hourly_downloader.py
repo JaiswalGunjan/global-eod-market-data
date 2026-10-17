@@ -285,6 +285,12 @@ def build_hour_files(pairs, out_root: Path, metastock_ascii: bool, start: str = 
             progress.step("ok")
 
 
+def _check_nse_factors(out_root: Path):
+    if not (out_root / "NSE" / "recon" / "scale_factors.csv").exists():
+        log.warning("NSE hourly as-traded needs factors: run nse_hourly_factors.py first "
+                    "(without them NSE is written unchanged)")
+
+
 def resolve_tickers(args):
     if args.ticker:
         if not args.ticker_exchange:
@@ -352,6 +358,8 @@ def main():
         sys.exit("No tickers to process.")
     if not args.skip_download:
         download_all_hourly(pairs, out_root, args.workers, args.progress_every)
+    if args.price_basis == "raw" and any(ex == "NSE" for _, ex in pairs):
+        _check_nse_factors(out_root)
     build_hour_files(pairs, out_root, args.metastock_ascii, progress_every=args.progress_every,
                      price_basis=args.price_basis)
     log.info("Done.")
