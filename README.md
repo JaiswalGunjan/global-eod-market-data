@@ -528,6 +528,8 @@ as-traded (verdicts in `recon/split_evidence.csv`). Then build with `--price-bas
     python eod_downloader.py --skip-download --price-basis raw --exchanges NYSE NASDAQ
     python hourly_downloader.py --skip-download --price-basis raw --exchanges NYSE NASDAQ   # -> <EX>/as_traded/
 
+**One-command refresh:** `python update_us.py` (download, re-derive factors, rebuild as-traded; daily and hourly; options `--exchanges`, `--daily-only`, `--hourly-only`, `--skip-download`, `--include-delisted`).
+
 Delisted tickers: Yahoo has no delisted directory, so give `us_factors.py --delisted-file symbols.txt`
 (a list you supply); those Yahoo still serves are downloaded into the raw cache and registered in
 `<EX>/delisted_tickers.csv`, and `--include-delisted` adds them to the build. Spin-offs/mergers and
