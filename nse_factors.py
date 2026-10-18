@@ -47,6 +47,41 @@ def segments(dates, logr):
     return segs, outl
 
 
+def derive_factors(j, out: Path):
+    """j: DataFrame(Symbol, Date, Official, Yahoo, Ratio) of matched days. Writes scale_factors.csv,
+    factor_outliers.csv and factor_check.csv into `out` (shared with bse_factors.py)."""
+    rows, outl = [], []
+    for sym, g in j.sort_values(["Symbol", "Date"]).groupby("Symbol", sort=False):
+        d, lr = g.Date.values, np.log(g.Ratio.values)
+        segs, bad = segments(d, lr)
+        for i0, i1, m in segs:
+            f = round(float(np.exp(m)), 4)
+            rows.append((sym, d[i0], d[i1], f, i1 - i0 + 1, is_clean_ratio(f)))
+        outl.extend(g.iloc[bad][["Symbol", "Date", "Official", "Yahoo", "Ratio"]].itertuples(index=False))
+
+    seg = pd.DataFrame(rows, columns=["Symbol", "From", "To", "Factor", "Days", "Clean"])
+    seg.to_csv(out / "scale_factors.csv", index=False)
+    pd.DataFrame(outl, columns=["Symbol", "Date", "Official", "Yahoo", "Ratio"]).to_csv(out / "factor_outliers.csv", index=False)
+
+    # how well do the segments reproduce official closes?
+    lookup = seg.sort_values(["Symbol", "From"])
+    j = j.merge(lookup, on="Symbol")
+    j = j[(j.Date >= j.From) & (j.Date <= j.To)]
+    err = (j.Yahoo * j.Factor / j.Official - 1).abs()
+    summary = pd.DataFrame([{
+        "tickers": seg.Symbol.nunique(), "segments": len(seg),
+        "tickers_with_factor_ne_1": int(seg[(seg.Factor - 1).abs() > 0.005].Symbol.nunique()),
+        "non_clean_segments": int((~seg.Clean & ((seg.Factor - 1).abs() > 0.005)).sum()),
+        "days_within_0.5pct": round(float((err <= 0.005).mean()), 5),
+        "days_within_2pct": round(float((err <= 0.02).mean()), 5),
+        "outlier_days": len(outl),
+    }])
+    summary.to_csv(out / "factor_check.csv", index=False)
+    log.info("\n%s", summary.T.to_string(header=False))
+    log.info("outputs in %s", out)
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="market_data_daily")
@@ -82,35 +117,7 @@ def main():
     j["Ratio"] = j.Official / j.Yahoo
     log.info("%d tickers, %d matched days", j.Symbol.nunique(), len(j))
 
-    rows, outl = [], []
-    for sym, g in j.sort_values(["Symbol", "Date"]).groupby("Symbol", sort=False):
-        d, lr = g.Date.values, np.log(g.Ratio.values)
-        segs, bad = segments(d, lr)
-        for i0, i1, m in segs:
-            f = round(float(np.exp(m)), 4)
-            rows.append((sym, d[i0], d[i1], f, i1 - i0 + 1, is_clean_ratio(f)))
-        outl.extend(g.iloc[bad][["Symbol", "Date", "Official", "Yahoo", "Ratio"]].itertuples(index=False))
-
-    seg = pd.DataFrame(rows, columns=["Symbol", "From", "To", "Factor", "Days", "Clean"])
-    seg.to_csv(out / "scale_factors.csv", index=False)
-    pd.DataFrame(outl, columns=["Symbol", "Date", "Official", "Yahoo", "Ratio"]).to_csv(out / "factor_outliers.csv", index=False)
-
-    # how well do the segments reproduce official closes?
-    lookup = seg.sort_values(["Symbol", "From"])
-    j = j.merge(lookup, on="Symbol")
-    j = j[(j.Date >= j.From) & (j.Date <= j.To)]
-    err = (j.Yahoo * j.Factor / j.Official - 1).abs()
-    summary = pd.DataFrame([{
-        "tickers": seg.Symbol.nunique(), "segments": len(seg),
-        "tickers_with_factor_ne_1": int(seg[(seg.Factor - 1).abs() > 0.005].Symbol.nunique()),
-        "non_clean_segments": int((~seg.Clean & ((seg.Factor - 1).abs() > 0.005)).sum()),
-        "days_within_0.5pct": round(float((err <= 0.005).mean()), 5),
-        "days_within_2pct": round(float((err <= 0.02).mean()), 5),
-        "outlier_days": len(outl),
-    }])
-    summary.to_csv(out / "factor_check.csv", index=False)
-    log.info("\n%s", summary.T.to_string(header=False))
-    log.info("outputs in %s", out)
+    derive_factors(j, out)
 
 
 if __name__ == "__main__":

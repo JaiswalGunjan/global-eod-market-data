@@ -4,7 +4,7 @@ raw/ caches hold Yahoo's retroactively split/bonus/rights-adjusted prices ("spli
 nse_factors.py derives exact per-date scale factors (<EX>/recon/scale_factors.csv) so that
     as_traded_price  = yahoo_price  * Factor
     as_traded_volume = yahoo_volume / Factor
-This module applies them to one ticker's frame. Only NSE has factors; other exchanges are returned unchanged.
+This module applies them to one ticker's frame. Only FACTOR_EXCHANGES have factors; other exchanges are returned unchanged.
 """
 import logging
 from pathlib import Path
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 log = logging.getLogger("market_dl")
-FACTOR_EXCHANGES = {"NSE", "NYSE", "NASDAQ"}   # NSE: nse_factors.py; NYSE/NASDAQ: us_factors.py (Yahoo splits)
+FACTOR_EXCHANGES = {"NSE", "BSE", "NYSE", "NASDAQ"}   # NSE: nse_factors.py; BSE: bse_factors.py; NYSE/NASDAQ: us_factors.py
 _cache = {}          # path -> (mtime, {symbol: (from_dates ndarray, factors ndarray)})
 
 
@@ -51,7 +51,7 @@ def apply_raw_basis(df: pd.DataFrame, exchange, raw_dir: Path, date_col: str = "
     idx = np.clip(np.searchsorted(froms, days, side="right") - 1, 0, len(froms) - 1)
     f = facs[idx]
     out = df.copy()
-    nd = 2 if exchange == "NSE" else 4
+    nd = 2 if exchange in ("NSE", "BSE") else 4
     for c in ("Open", "High", "Low", "Close"):
         out[c] = (out[c] * f).round(nd)
     out["Volume"] = (pd.to_numeric(out["Volume"], errors="coerce") / f).round()

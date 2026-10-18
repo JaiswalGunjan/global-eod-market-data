@@ -51,6 +51,15 @@ OLD_URL = BASE_URL + "EQ{dmy}_CSV.ZIP"
 NEW_FORMAT_FROM = date(2024, 7, 8)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+# BSE scrip codes starting with these are debt: 9xxxxx corporate bonds/NCDs, 8xxxxx government securities and gold
+# bonds. Equities, SME stocks, ETF/fund units (5xxxxx) and rights entitlements (7xxxxx) are kept.
+DEBT_CODE_PREFIXES = ("8", "9")
+
+
+def drop_debt(df: pd.DataFrame, col: str = "Code") -> pd.DataFrame:
+    return df[~df[col].astype(str).str.startswith(DEBT_CODE_PREFIXES)]
+
+
 # Columns kept in the per-day cache files.
 DAY_COLS = ["Code", "Ticker", "Name", "Open", "High", "Low", "Close", "PrevClose", "Volume"]
 
@@ -85,7 +94,8 @@ def _parse_new(text: str) -> pd.DataFrame:
 
 def _parse_old(raw: bytes) -> pd.DataFrame:
     z = zipfile.ZipFile(io.BytesIO(raw))
-    df = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
+    # a few old files hold a corrupt line (2021-12-29); drop it rather than lose the whole day
+    df = pd.read_csv(z.open(z.namelist()[0]), dtype=str, engine="python", on_bad_lines="skip")
     df.columns = [c.strip() for c in df.columns]
     return pd.DataFrame({
         "Code": df["SC_CODE"].str.strip(),
@@ -114,7 +124,7 @@ def fetch_day(d: date, retries: int = 3):
             if body[:200].lstrip().lower().startswith((b"<!doc", b"<html")):
                 return None  # BSE's "no file for this date" page (served with HTTP 200)
             df = _parse_new(body.decode("utf-8-sig")) if d >= NEW_FORMAT_FROM else _parse_old(body)
-            df = df[(df["Code"] != "") & (df["Close"] > 0)]
+            df = drop_debt(df[(df["Code"] != "") & (df["Close"] > 0)])
             return df.reset_index(drop=True)
         except Exception as e:
             last = e
@@ -160,7 +170,7 @@ def _latest_ticker_map(cache_dir: Path) -> dict:
         elif status == "holiday":
             continue
         if df is not None and len(df):
-            m = df[df["Ticker"] != ""]
+            m = drop_debt(df[df["Ticker"] != ""])
             return dict(zip(m["Ticker"], m["Code"]))
     return {}
 
@@ -228,6 +238,7 @@ def adjust_for_splits(g: pd.DataFrame, splits) -> tuple:
     """g: one scrip's rows sorted by Date. Divides prices (and multiplies
     volume) on every row BEFORE each split date. Returns (frame, n_applied)."""
     g = g.copy()
+    g["Volume"] = g["Volume"].astype("float64")   # split ratios are floats; an int column rejects the assignment
     first, last = g["Date"].iloc[0], g["Date"].iloc[-1]
     applied = 0
     for d, ratio in splits:
@@ -252,6 +263,70 @@ def suspect_gaps(g: pd.DataFrame) -> list:
     r = g["Close"] / g["Close"].shift(1)
     bad = (r < SUSPECT_LOW) | (r > SUSPECT_HIGH)
     return [(g["Date"].loc[i].strftime("%Y-%m-%d"), float(r.loc[i])) for i in g.index[bad]]
+
+
+# --------------------------------------------------------------------------
+# Official (unadjusted) day files, for the as-traded / delisted pipeline
+# --------------------------------------------------------------------------
+
+def cache_days(start: str, end: str, cache_dir: Path, max_workers: int = 8, cancel_event=None) -> list:
+    """Make sure every day in [start, end) is in cache_dir (YYYYMMDD.csv; empty file = nothing published).
+    Returns the days that failed to download (re-run to retry)."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    start_d = datetime.strptime(start, "%Y-%m-%d").date()
+    end_d = datetime.strptime(end, "%Y-%m-%d").date()
+    today = date.today()
+    todo = [d for d in (start_d + timedelta(days=i) for i in range((end_d - start_d).days))
+            if d.weekday() < 5 and _cached_day(d, cache_dir)[0] == "missing"]
+    log.info(f"BSE bhavcopy cache: {len(todo)} day file(s) to fetch into {cache_dir}")
+    failed, done, t0, lock = [], 0, time.time(), threading.Lock()
+
+    def _work(d):
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        df = fetch_day(d)
+        if df is not None or d < today - timedelta(days=1):   # today's file may simply not be out yet
+            _store_day(d, df, cache_dir)
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
+        futures = {ex.submit(_work, d): d for d in todo}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.error(f"BSE bhavcopy {futures[fut]}: {e}")
+                failed.append(futures[fut])
+            with lock:
+                done += 1
+                if done % 100 == 0 or done == len(todo):
+                    el = time.time() - t0
+                    log.info(f"BSE bhavcopy {done}/{len(todo)} days | failed={len(failed)} | {el:.0f}s | "
+                             f"ETA ~{el / done * (len(todo) - done):.0f}s")
+    if failed:
+        log.warning(f"{len(failed)} day file(s) failed; re-run to retry them")
+    return failed
+
+
+def load_official(cache_dir: Path, start: str = None, end: str = None) -> pd.DataFrame:
+    """All cached day files as one frame: Date + DAY_COLS (unadjusted, as traded). Optional [start, end] filter."""
+    frames = []
+    for p in sorted(Path(cache_dir).glob("[0-9]*.csv")):
+        d = pd.Timestamp(datetime.strptime(p.stem, "%Y%m%d"))
+        if (start and d < pd.Timestamp(start)) or (end and d > pd.Timestamp(end)):
+            continue
+        if p.stat().st_size < 60:
+            continue
+        df = pd.read_csv(p, dtype={"Code": str, "Ticker": str, "Name": str}).fillna({"Ticker": "", "Name": ""})
+        frames.append(drop_debt(df).assign(Date=d))      # day files cached before the debt filter still hold bonds
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=DAY_COLS + ["Date"])
+
+
+def latest_ticker_by_code(off: pd.DataFrame) -> dict:
+    """{scrip code: most recent non-blank ticker}. Old-format files carry no tickers, so codes that left
+    before mid-2024 have none."""
+    t = off[off["Ticker"] != ""].sort_values("Date").drop_duplicates("Code", keep="last")
+    return dict(zip(t["Code"], t["Ticker"]))
 
 
 # --------------------------------------------------------------------------

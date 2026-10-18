@@ -168,7 +168,11 @@ def _inject_extra_tickers(df: pd.DataFrame, exchanges) -> pd.DataFrame:
     BOTH the cached-read path and the freshly-fetched path in
     fetch_ticker_directory(), so an index added here shows up immediately
     -- including for anyone re-running against an older cache file that
-    predates this -- without needing --refresh-tickers."""
+    predates this -- without needing --refresh-tickers. Also drops BSE bonds/NCDs/G-secs (scrip codes 8xxxxx and
+    9xxxxx, parsed from the "(code)" the BSE directory appends to Name), which older caches still contain."""
+    if "Name" in df.columns:
+        code = df["Name"].astype(str).str.extract(r"\((\d+)\)\s*$")[0].fillna("")
+        df = df[~((df["Exchange"] == "BSE") & code.str.startswith(("8", "9")))]
     rows = []
     for ex in exchanges:
         for extra in EXTRA_INDEX_TICKERS.get((ex or "").upper(), []):
@@ -302,7 +306,7 @@ def _fetch_bse_directory() -> pd.DataFrame:
         ticker = df["TckrSymb"].astype(str).str.strip()
         company = df["FinInstrmNm"].astype(str).str.strip()
         out = pd.DataFrame({"Symbol": ticker, "Name": company + " (" + code + ")", "Exchange": "BSE"})
-        out = out[out["Symbol"] != ""]
+        out = out[(out["Symbol"] != "") & ~code.str.startswith(("8", "9"))]   # no bonds/NCDs/G-secs
         log.info(f"BSE bhavcopy {day:%Y-%m-%d}: {len(out)} securities")
         return out
     raise RuntimeError(f"no BSE bhavcopy found in the last {BSE_BHAVCOPY_LOOKBACK_DAYS} days"
@@ -607,6 +611,13 @@ def _looks_sparse(data, start: str, end: str) -> bool:
     return expected >= 3 and n < 0.6 * expected
 
 
+def _gap_is_suspicious(fetch_start: str, fetch_end: str, min_bdays: int = 3) -> bool:
+    """True if [fetch_start, fetch_end) holds enough business days that an
+    empty Yahoo answer is unlikely to be just a weekend/holiday."""
+    last = pd.Timestamp(fetch_end) - pd.Timedelta(days=1)
+    return len(pd.bdate_range(fetch_start, last)) >= min_bdays if last >= pd.Timestamp(fetch_start) else False
+
+
 def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
                      retries: int = 3, pause: float = 1.0, exchange: str = None) -> str:
     """Download one ticker's OHLCV data and cache it to raw_dir/<SYMBOL>.csv,
@@ -654,6 +665,7 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
             except Exception:
                 existing_df = None  # corrupt cache -- fall back to a full re-fetch
 
+    stale = False
     for attempt in range(1, retries + 1):
         try:
             data = _yf_fetch(yf_symbol, fetch_start, fetch_end)
@@ -665,7 +677,6 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
                 # but only if it actually has more data than the BSE one.
                 nse_data = _yf_fetch(yf_download_symbol(ticker, "NSE"), fetch_start, fetch_end)
                 n_bse = 0 if data is None else len(data)
-    stale = False
                 if nse_data is not None and len(nse_data) > n_bse:
                     log.info(f"[{ticker}] Yahoo has {n_bse} BSE row(s); using NSE ({ticker}.NS) "
                              f"data instead ({len(nse_data)} rows)")
@@ -710,6 +721,8 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
             log.warning(f"[{ticker}] attempt {attempt}/{retries} failed: {e}")
             time.sleep(pause * attempt)
 
+    if stale:
+        return "stale"
     log.error(f"[{ticker}] giving up after {retries} attempts")
     return "failed"
 
@@ -721,8 +734,6 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
     """Downloads every ticker in `tickers`, in parallel (max_workers threads
     at a time -- Yahoo Finance calls are I/O-bound, so threads work fine
     here without needing multiprocessing). All downloads finish before this
-    if stale:
-        return "stale"
     function returns; callers should build output CSVs only after this
     returns, not per-ticker, to avoid rebuilding output repeatedly.
 
@@ -764,6 +775,7 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
                 return []
     failed = []
     no_data = []
+    stale_list = []
     total = len(tickers)
     done = 0
     start_time = time.time()
@@ -775,7 +787,6 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         # Submit everything upfront -- ThreadPoolExecutor queues tasks beyond
-    stale_list = []
         # max_workers rather than blocking, so this returns immediately
         # regardless of ticker count. Cancellation below relies on that: it
         # cancels whichever futures haven't STARTED yet (still queued), which
@@ -813,6 +824,8 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
                     failed.append(ticker)
                 elif status == "no_data":
                     no_data.append(ticker)
+                elif status == "stale":
+                    stale_list.append(ticker)
                 snapshot = (done, len(failed), len(no_data))
 
             if progress_callback:
@@ -824,8 +837,6 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
                 eta_min = rate * (total - snapshot[0]) / 60
                 log.info(
                     f"Progress {snapshot[0]}/{total} | failed={snapshot[1]} | "
-                elif status == "stale":
-                    stale_list.append(ticker)
                     f"no_data={snapshot[2]} | ETA ~{eta_min:.0f} min"
                 )
 
@@ -839,6 +850,12 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
         fail_path.write_text("\n".join(failed))
         log.warning(f"{len(failed)} tickers genuinely failed (network/API errors). See {fail_path}")
 
+    if stale_list:
+        stale_path = raw_dir.parent / "stale_tickers.txt"
+        stale_path.write_text("\n".join(stale_list))
+        log.warning(f"{len(stale_list)} ticker(s) returned nothing for a multi-day gap after retries "
+                    f"(delisted, or a transient empty Yahoo response; re-run to retry). See {stale_path}")
+
     if no_data:
         no_data_path = raw_dir.parent / "no_data_tickers.txt"
         no_data_path.write_text("\n".join(no_data))
@@ -850,12 +867,6 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
 # --------------------------------------------------------------------------
 # 3. Reorganize into daily CSVs (or per-symbol / combined CSVs)
 # --------------------------------------------------------------------------
-    if stale_list:
-        stale_path = raw_dir.parent / "stale_tickers.txt"
-        stale_path.write_text("\n".join(stale_list))
-        log.warning(f"{len(stale_list)} ticker(s) returned nothing for a multi-day gap after retries "
-                    f"(delisted, or a transient empty Yahoo response; re-run to retry). See {stale_path}")
-
 
 # MetaStock ASCII layout, as read by MetaStock's Downloader (File > Convert,
 # source "ASCII Text"): one record per line, comma-separated, with a header
@@ -951,16 +962,16 @@ def _select_raw_files(raw_dir: Path, tickers=None, exchange_map=None):
 
 
 def _delisted_files(raw_dir: Path, price_basis: str, include_delisted: bool):
-    """NSE: <EX>/raw_delisted/ files (symbols Yahoo no longer serves, from the official bhavcopies); as-traded,
+    """NSE/BSE: <EX>/raw_delisted/ files (symbols Yahoo no longer serves, from the official bhavcopies); as-traded,
     so they only mix with the 'raw' price basis. NYSE/NASDAQ: raw/ files of the symbols listed in
     <EX>/delisted_tickers.csv (made by us_factors.py --delisted-file); they go through the normal split factors."""
     if not include_delisted:
         return []
     if price_basis != "raw":
         raise ValueError("--include-delisted needs --price-basis raw (delisted files are as-traded prices)")
-    files = sorted((raw_dir.parent / "raw_delisted").glob("NSE.*.csv"))
-    reg = raw_dir.parent / "delisted_tickers.csv"
     ex = raw_dir.parent.name
+    files = sorted((raw_dir.parent / "raw_delisted").glob(f"{EXCHANGE_PREFIX.get(ex, ex)}.*.csv"))
+    reg = raw_dir.parent / "delisted_tickers.csv"
     if reg.exists() and ex in EXCHANGE_PREFIX:
         for sym in pd.read_csv(reg, dtype=str)["Symbol"].dropna():
             p = raw_dir / f"{prefixed_symbol(sym, ex)}.csv"
