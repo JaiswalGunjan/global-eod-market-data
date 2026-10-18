@@ -6,6 +6,8 @@ Writes <root>/NSE/corporate_actions.csv  (Date,Symbol,Type,Ratio,NewSymbol,Sourc
   rename       same security, new symbol (same ISIN, stitched by nse_stitch.py); Ratio 1
   merger       Old holders receive Ratio shares of NewSymbol per share held; from nse_mergers.csv
   delist       last traded day (Date) of a symbol that is not a rename or merger; Note has the last close
+               (plus NSE's delisting route/date/exit price when nse_exit_info.csv knows the symbol)
+  rights_entitlement_end  a rights-entitlement ticker (e.g. XYZ-RE) ceasing to trade; not a company exit
 and <root>/NSE/recon/merger_check.csv comparing each declared merger ratio with the ratio implied by prices.
 
 Merger input (nse_mergers.csv, hand-maintained): Old,New,Ratio,Note. Ratio blank -> implied by prices. Mergers are
@@ -35,6 +37,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="market_data_daily")
     ap.add_argument("--mergers", default="nse_mergers.csv")
+    ap.add_argument("--exit-info", default="nse_exit_info.csv",
+                    help="from nse_import_workbook.py; annotates delist events, retypes rights entitlements")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -63,7 +67,9 @@ def main():
     # 2. renames the stitcher approved
     st = pd.read_csv(dl / "stitch_report.csv", dtype=str).fillna("")
     for r in st[st.Stitch == "Y"].itertuples():
-        events.append((r.NewFirstAfter, r.Old, "rename", 1, r.New, "same ISIN (nse_stitch.py)", ""))
+        events.append((r.NewFirstAfter, r.Old, "rename", 1, r.New,
+                       "ISIN changed, same issuer (nse_renames.csv)" if r.Why else "same ISIN (nse_stitch.py)",
+                       f"close ratio across the join {r.Ratio}" if r.Why else ""))
 
     # 3. mergers (manual), validated against prices
     checks = []
@@ -99,6 +105,9 @@ def main():
 
     # 4. delistings: gone for good and not explained by a rename or merger
     isin = pd.read_csv(dl / "isin_map.csv", dtype=str).fillna("")
+    exit_info = {}
+    if Path(args.exit_info).exists():
+        exit_info = {x.Symbol: x for x in pd.read_csv(args.exit_info, dtype=str).fillna("").itertuples()}
     renamed = set(st[st.Stitch == "Y"].Old)
     cutoff = str(pd.Timestamp(str(all_dates[-1])) - pd.Timedelta(days=30))[:10]
     for r in isin.itertuples():
@@ -108,7 +117,16 @@ def main():
         note = f"last close {c:g}"
         if r.Successor:
             note += f"; same ISIN reappears as {r.Successor} after a long gap (not stitched)"
-        events.append((r.Last, r.Symbol, "delist", "", "", "official bhavcopy: last traded day", note))
+        etype = "delist"
+        x = exit_info.get(r.Symbol)
+        if x is not None:
+            if x.Category == "rights_entitlement":
+                etype = "rights_entitlement_end"       # a rights-entitlement ticker expiring, not a company exit
+            elif x.Category == "delisted":
+                note += f"; NSE delisting via {x.Route} on {x.OfficialDate}"
+                if x.ExitPrice:
+                    note += f", exit price {x.ExitPrice}"
+        events.append((r.Last, r.Symbol, etype, "", "", "official bhavcopy: last traded day", note))
 
     out = pd.DataFrame(events, columns=["Date", "Symbol", "Type", "Ratio", "NewSymbol", "Source", "Note"])
     out = out.sort_values(["Date", "Symbol", "Type"]).reset_index(drop=True)
