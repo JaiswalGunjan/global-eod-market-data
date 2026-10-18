@@ -624,7 +624,10 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
     and merged into the existing file, instead of re-downloading the whole
     range from scratch.
 
-    Returns one of: "cached", "ok", "no_data", "failed".
+    Returns one of: "cached", "ok", "no_data", "failed", "stale".
+    "stale" means the incremental fetch came back empty although the missing
+    window spans several business days (delisted ticker or transient empty
+    Yahoo response); the existing cache is left untouched.
     "no_data" means Yahoo has no history for this symbol at all (common
     for warrants/units/rights) -- this is expected and not a real error.
     """
@@ -662,15 +665,22 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
                 # but only if it actually has more data than the BSE one.
                 nse_data = _yf_fetch(yf_download_symbol(ticker, "NSE"), fetch_start, fetch_end)
                 n_bse = 0 if data is None else len(data)
+    stale = False
                 if nse_data is not None and len(nse_data) > n_bse:
                     log.info(f"[{ticker}] Yahoo has {n_bse} BSE row(s); using NSE ({ticker}.NS) "
                              f"data instead ({len(nse_data)} rows)")
                     data = nse_data
             if data is None or data.empty:
                 if existing_df is not None:
-                    # Incremental fetch found nothing new (e.g. no trading
-                    # days in the delta window) -- what's already cached is
-                    # still valid, nothing to do.
+                    # Incremental fetch found nothing new. A short window
+                    # (weekend/holiday) is normal; a window with several
+                    # business days is either a delisted ticker or a
+                    # transient empty Yahoo response, so retry and then
+                    # report "stale" instead of silently claiming "cached".
+                    if _gap_is_suspicious(fetch_start, fetch_end):
+                        stale = True
+                        time.sleep(pause * attempt)
+                        continue
                     return "cached"
                 # No data exists for this symbol (e.g. warrant/unit/rights
                 # with no trading history). Write an empty marker so we
@@ -711,6 +721,8 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
     """Downloads every ticker in `tickers`, in parallel (max_workers threads
     at a time -- Yahoo Finance calls are I/O-bound, so threads work fine
     here without needing multiprocessing). All downloads finish before this
+    if stale:
+        return "stale"
     function returns; callers should build output CSVs only after this
     returns, not per-ticker, to avoid rebuilding output repeatedly.
 
@@ -763,6 +775,7 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         # Submit everything upfront -- ThreadPoolExecutor queues tasks beyond
+    stale_list = []
         # max_workers rather than blocking, so this returns immediately
         # regardless of ticker count. Cancellation below relies on that: it
         # cancels whichever futures haven't STARTED yet (still queued), which
@@ -811,6 +824,8 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
                 eta_min = rate * (total - snapshot[0]) / 60
                 log.info(
                     f"Progress {snapshot[0]}/{total} | failed={snapshot[1]} | "
+                elif status == "stale":
+                    stale_list.append(ticker)
                     f"no_data={snapshot[2]} | ETA ~{eta_min:.0f} min"
                 )
 
@@ -835,6 +850,12 @@ def download_all(tickers, start, end, raw_dir: Path, pause: float = 0.3,
 # --------------------------------------------------------------------------
 # 3. Reorganize into daily CSVs (or per-symbol / combined CSVs)
 # --------------------------------------------------------------------------
+    if stale_list:
+        stale_path = raw_dir.parent / "stale_tickers.txt"
+        stale_path.write_text("\n".join(stale_list))
+        log.warning(f"{len(stale_list)} ticker(s) returned nothing for a multi-day gap after retries "
+                    f"(delisted, or a transient empty Yahoo response; re-run to retry). See {stale_path}")
+
 
 # MetaStock ASCII layout, as read by MetaStock's Downloader (File > Convert,
 # source "ASCII Text"): one record per line, comma-separated, with a header

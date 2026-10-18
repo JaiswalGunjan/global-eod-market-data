@@ -65,7 +65,8 @@ def download_ticker_hourly(ticker: str, exchange: str, raw_dir: Path, retries: i
     """Fetch 1h bars for one ticker into raw_dir/<EXCHANGE>.<TICKER>.csv.
     First run: the last ~730 days. Later runs: from the last cached day
     onward, merged into the cache (the newest cached bar is re-fetched since
-    it may have been a still-forming bar). Returns ok/cached/no_data/failed."""
+    it may have been a still-forming bar). Returns ok/cached/no_data/failed/stale
+    (stale: empty answer for a multi-day gap; cache left untouched)."""
     raw_path = raw_dir / f"{core.prefixed_symbol(ticker, exchange)}.csv"
     yf_symbol = core.yf_download_symbol(ticker, exchange)
     earliest = (datetime.now() - timedelta(days=YAHOO_1H_MAX_DAYS)).strftime("%Y-%m-%d")
@@ -82,11 +83,18 @@ def download_ticker_hourly(ticker: str, exchange: str, raw_dir: Path, retries: i
         if existing is not None:
             fetch_start = max(earliest, existing["Datetime"].max().strftime("%Y-%m-%d"))
 
+    stale = False
     for attempt in range(1, retries + 1):
         try:
             data = _yf_fetch_hourly(yf_symbol, fetch_start)
             if data is None or data.empty:
                 if existing is not None:
+                    # Several business days with no bars is suspicious
+                    # (delisted, or a transient empty Yahoo response).
+                    if core._gap_is_suspicious(fetch_start, datetime.now().strftime("%Y-%m-%d")):
+                        stale = True
+                        time.sleep(attempt)
+                        continue
                     return "cached"
                 pd.DataFrame(columns=RAW_COLUMNS).to_csv(raw_path, index=False)
                 return "no_data"
@@ -109,6 +117,8 @@ def download_ticker_hourly(ticker: str, exchange: str, raw_dir: Path, retries: i
             log.warning(f"[{yf_symbol}] attempt {attempt}/{retries} failed: {e}")
             time.sleep(attempt)
 
+    if stale:
+        return "stale"
     log.error(f"[{yf_symbol}] giving up after {retries} attempts")
     return "failed"
 
@@ -138,7 +148,8 @@ class _MinuteProgress:
             msg = f"PROGRESS {pct:5.1f}% | {label}{self.done:,}/{self.total:,} {self.unit} | "
             if self.unit == "tickers":
                 msg += (f"new {self.counts['ok']:,}, up-to-date {self.counts['cached']:,}, "
-                        f"no data {self.counts['no_data']:,}, failed {self.counts['failed']:,} | ")
+                        f"no data {self.counts['no_data']:,}, stale {self.counts.get('stale', 0):,}, "
+                        f"failed {self.counts['failed']:,} | ")
             msg += f"elapsed {_fmt_secs(elapsed)}"
             if self.done < self.total:
                 msg += f" | ETA {_fmt_secs(elapsed / self.done * (self.total - self.done))}"
