@@ -28,6 +28,39 @@ downloads — see [section 2 below](#a-note-on-exchanges-without-a-bulk-list)
 — but individual tickers on any of the 16 work immediately either way, no
 extra step needed.
 
+## Data sources and corporate actions (CLI default since 2026-11-10)
+
+| Exchange | Source | Updated by | Adjusted for | Output folders |
+|---|---|---|---|---|
+| NASDAQ, NYSE | Alpaca (SIP feed), delisted companies included | `alpaca_us.py` → `<EX>/alpaca/` | splits, reverse splits, spin-offs (not dividends) | `daily_alpaca/`, `by_symbol_alpaca/`, `combined_alpaca/`, `bhavcopy_alpaca/` |
+| NSE | NSE's official bhavcopies + NSE's corporate-actions list, delisted/merged companies included | `nse_bhavcopy.py` → `NSE/official/` | splits, bonuses, rights, demergers, big special dividends; renames joined (TATAMOTORS → TMPV) | `daily_official/`, `by_symbol_official/`, `combined_official/`, `bhavcopy_official/` |
+| everything else | Yahoo Finance | `download_ticker()` → `<EX>/raw/` | splits (Yahoo's own adjustment) | `daily/`, `by_symbol/`, `combined/`, `bhavcopy/` |
+
+History is always on **today's** share basis, also when it was downloaded before the event:
+
+* **NSE** is rebuilt from the day-file cache whenever a new day or corporate action arrives (about 2 minutes), so
+  every earlier price is re-adjusted. The decisions are in `NSE/official_info/events.csv`; moves beyond x1.6 that no
+  event explains are listed in `NSE/official_info/gaps.csv` (not adjusted). Hand-kept input: `nse_demergers.csv`.
+* **Alpaca** files are extended from the second-to-last stored bar. If Alpaca's adjusted price for that day
+  changed, and its corporate-actions list has a split or spin-off for the symbol, the stored history is rescaled
+  (exact listed ratio). A change no listed event explains (usually a ticker now used by another company, or an ADS
+  ratio change) is **not** appended. It is logged as `skipped` in `<EX>/alpaca_updates.csv`: check those by hand.
+  Renames are followed; a reused ticker keeps the old company as `TICKER@date`.
+* **Yahoo** caches are extended from the second-to-last cached bar too; if its close changed (a split since the
+  last run), the whole history is downloaded again.
+
+```bash
+python eod_downloader.py --exchanges NSE NASDAQ NYSE --layout daily   # update + build (MetaStock ASCII by default)
+python eod_downloader.py --exchanges NSE --skip-download                                 # offline rebuild
+python nse_bhavcopy.py            # NSE source only (download + adjusted rebuild)
+python alpaca_us.py               # US source only (needs .alpaca2.env / .alpaca3.env or APCA_API_* variables)
+```
+
+`--us-source yahoo` / `--nse-source yahoo` bring back the old Yahoo sources (and they stay the default with
+`--price-basis raw`, the as-traded pipeline in section 6).
+
+**GUI:** section 1 has two **Data sources** boxes, both ticked by default: *NASDAQ / NYSE from Alpaca* and *NSE from NSE's official bhavcopies*. With ALL ticked, every symbol of that source is built (delisted ones too); with picked tickers, only those are updated and built (a US ticker takes seconds; NSE still checks for new day files and rebuilds `NSE/official/` when something changed, about 2 minutes). Untick a box to use Yahoo for that market instead. The progress bar and Cancel work during these steps. Hourly mode always uses Yahoo (the boxes are greyed out).
+
 ## 0. GUI (recommended)
 
 ```bash
@@ -77,8 +110,9 @@ A window opens with:
    they're just less convenient.
 4. **CSV layout** — **Data interval** (Daily or Hourly), then single combined
    file (default), one file per day, one per symbol, or all three, plus:
-   - **Strict MetaStock ASCII format** — check this if you're actually
-     importing into MetaStock (see [section 4](#4-about-the-metastock-format))
+   - **MetaStock ASCII format** — ticked by default (see
+     [section 4](#4-about-the-metastock-format)); untick for the plain
+     `Symbol,Date,...` layout
    - Data is always saved per exchange: each exchange gets its own
      `<save location>/<EXCHANGE>/` folder with its own `raw/` cache and
      `daily/`/`by_symbol/`/`combined/`/`bhavcopy/` output
@@ -398,11 +432,12 @@ anywhere else).
 
 ## 4. About the Metastock format
 
-By default this tool writes a friendly CSV layout (`Symbol,Date,Open,High,
-Low,Close,Volume`, with a header row) that's easy to open in Excel/pandas
-but **isn't itself a format MetaStock recognizes**. To actually import into
-MetaStock, add `--metastock-ascii` (CLI) or check "Strict MetaStock ASCII
-format" (GUI). That switches every layout to the specific convention EOD
+Since 2026-11-10 every layout is written in **MetaStock ASCII** by default (CLI and GUI). Use
+`--no-metastock-ascii` (CLI; also `hourly_downloader.py`, `rebuild_combined.py`, `update_us.py`) or untick
+"MetaStock ASCII format" (GUI) for the friendly `Symbol,Date,Open,High,Low,Close,Volume` layout, which is easy to
+open in Excel/pandas but **isn't itself a format MetaStock recognizes**. Note: daily files are rewritten only for the
+dates in the run's range, so a folder built earlier in the other layout (e.g. `NASDAQ/daily/` before 2026-11-10)
+holds both layouts until it is rebuilt over its whole range. MetaStock ASCII follows the specific convention EOD
 data vendors (e.g. EODData) use for direct MetaStock import — confirmed via
 their published format docs and MetaStock's own community forum:
 

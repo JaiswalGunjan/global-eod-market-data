@@ -46,6 +46,13 @@ NOTES
   ticker list" periodically -- new listings/delistings happen constantly.
 - Closing the window while a download is running stops it; whatever was
   already downloaded stays cached, so re-running later resumes from there.
+- Data sources (section 1, both on by default): NASDAQ/NYSE from Alpaca
+  (<EX>/alpaca/, brought up to date by alpaca_us.py) and NSE from NSE's
+  official bhavcopies (NSE/official/, nse_bhavcopy.py). Both are kept
+  adjusted for splits / spin-offs / demergers and include delisted
+  companies; their outputs go to *_alpaca / *_official folders (daily_alpaca,
+  bhavcopy_official, ...). Untick them to use Yahoo instead. Every other
+  exchange, and the Hourly interval, always use Yahoo.
 """
 
 import json
@@ -239,7 +246,28 @@ class MarketDataGUI(tk.Tk):
             market_frame,
             text="   ...and adjust those BSE prices for splits/bonuses (via Yahoo's corporate-actions data)",
             variable=self.bse_adjust_var,
-        ).pack(anchor="w", padx=10, pady=(0, 6))
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+
+        ttk.Label(market_frame, text="Data sources (adjusted for splits / spin-offs / demergers, delisted "
+                                     "companies included):").pack(anchor="w", padx=10, pady=(4, 0))
+        self.us_alpaca_var = tk.BooleanVar(value=True)
+        self.us_alpaca_check = ttk.Checkbutton(
+            market_frame,
+            text="NASDAQ / NYSE from Alpaca (latest bars; output in <EX>/daily_alpaca, bhavcopy_alpaca, ...)",
+            variable=self.us_alpaca_var,
+        )
+        self.us_alpaca_check.pack(anchor="w", padx=10, pady=(0, 2))
+        self.nse_official_var = tk.BooleanVar(value=True)
+        self.nse_official_check = ttk.Checkbutton(
+            market_frame,
+            text="NSE from NSE's official bhavcopies + corporate actions (output in NSE/daily_official, "
+                 "bhavcopy_official, ...)",
+            variable=self.nse_official_var,
+        )
+        self.nse_official_check.pack(anchor="w", padx=10, pady=(0, 2))
+        ttk.Label(market_frame, text="   Unticked = Yahoo Finance (as for every other exchange); output in "
+                                     "<EX>/daily, bhavcopy, ...",
+                  foreground="#555555").pack(anchor="w", padx=10, pady=(0, 6))
 
         # 2. Ticker(s)
         ticker_frame = ttk.LabelFrame(body, text="2. Ticker(s)")
@@ -400,7 +428,7 @@ class MarketDataGUI(tk.Tk):
             rb = ttk.Radiobutton(radio_row, text=text, variable=self.layout_var, value=val)
             rb.pack(side="left", padx=8, pady=(8, 2))
             self.layout_radios.append(rb)
-        self.metastock_ascii_var = tk.BooleanVar(value=False)
+        self.metastock_ascii_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             layout_frame,
             text="MetaStock ASCII format (<TICKER>,<PER>,<DTYYYYMMDD>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>)",
@@ -409,7 +437,7 @@ class MarketDataGUI(tk.Tk):
         self.bhavcopy_var = tk.BooleanVar(value=True)
         self.bhavcopy_check = ttk.Checkbutton(
             layout_frame,
-            text="Also write per-day bhavcopy files for MetaStock (<EXCHANGE>/bhavcopy/<EXCHANGE>_YYYYMMDD.csv)",
+            text="Also write per-day bhavcopy files for MetaStock (<EXCHANGE>/bhavcopy*/<EXCHANGE>_YYYYMMDD.csv)",
             variable=self.bhavcopy_var,
         )
         self.bhavcopy_check.pack(anchor="w", padx=8, pady=(2, 2))
@@ -494,6 +522,8 @@ class MarketDataGUI(tk.Tk):
             "bhavcopy": self.bhavcopy_var.get(),
             "bse_bhavcopy": self.bse_bhavcopy_var.get(),
             "bse_adjust": self.bse_adjust_var.get(),
+            "us_source_alpaca": self.us_alpaca_var.get(),
+            "nse_source_official": self.nse_official_var.get(),
             "output": self._current_output_paths()["daily"],
             "output_hourly": self._current_output_paths()["hourly"],
             "size": [self.winfo_width(), self.winfo_height()],
@@ -511,14 +541,15 @@ class MarketDataGUI(tk.Tk):
         self._shown_interval = new
         self.output_var.set(self.output_paths[new])
         state = "disabled" if hourly_mode else "normal"
-        for w in (*self.layout_radios, self.bhavcopy_check):
+        for w in (*self.layout_radios, self.bhavcopy_check, self.us_alpaca_check, self.nse_official_check):
             w.config(state=state)
         self.interval_note_var.set(
             "Hourly: Yahoo only has the last ~730 days of 1h bars. Output goes to "
             "<save location>/<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv (all tickers for one hour per "
             "file). Re-run regularly -- each run "
             "appends new bars, so the cached history grows past 2 years. Only NSE, NASDAQ and NYSE "
-            "tickers are downloaded." if hourly_mode else "")
+            "tickers are downloaded, all from Yahoo (the Alpaca / NSE bhavcopy sources are daily only)."
+            if hourly_mode else "")
 
     def _current_output_paths(self) -> dict:
         """output_paths with the field's (possibly just edited) value applied."""
@@ -550,7 +581,9 @@ class MarketDataGUI(tk.Tk):
             self.layout_var.set(s.get("layout", "combined"))
             self.interval_var.set(s.get("interval", "daily"))
             self._on_interval_change()
-            self.metastock_ascii_var.set(bool(s.get("metastock_ascii", False)))
+            self.metastock_ascii_var.set(bool(s.get("metastock_ascii", True)))
+            self.us_alpaca_var.set(bool(s.get("us_source_alpaca", True)))
+            self.nse_official_var.set(bool(s.get("nse_source_official", True)))
             self.bhavcopy_var.set(bool(s.get("bhavcopy", True)))
             self.bse_bhavcopy_var.set(bool(s.get("bse_bhavcopy", False)))
             self.bse_adjust_var.set(bool(s.get("bse_adjust", True)))
@@ -965,6 +998,10 @@ class MarketDataGUI(tk.Tk):
         metastock_ascii = self.metastock_ascii_var.get()
         bse_source = "bhavcopy" if self.bse_bhavcopy_var.get() else "yahoo"
         bse_adjust = self.bse_adjust_var.get()
+        # exchange -> source, snapshot for the worker (which must not read Tk vars)
+        sources = {"NASDAQ": "alpaca" if self.us_alpaca_var.get() else "yahoo",
+                   "NYSE": "alpaca" if self.us_alpaca_var.get() else "yahoo",
+                   "NSE": "bhavcopy" if self.nse_official_var.get() else "yahoo"}
         self.write_bhavcopy = self.bhavcopy_var.get()  # snapshot: worker thread must not read Tk vars
         self.last_output_dir = output_dir
         self._save_settings()
@@ -976,7 +1013,9 @@ class MarketDataGUI(tk.Tk):
             f"--- Starting run | markets={markets or '(n/a, specific tickers)'} | "
             f"tickers={ticker_desc} | {start_s} -> {end_s} | interval={interval} | layout={layout} | "
             f"metastock_ascii={metastock_ascii} | "
-            f"output={output_dir} ---"
+            + (f"sources: NASDAQ/NYSE={sources['NASDAQ']}, NSE={sources['NSE']}, others=yahoo | "
+               if interval == "daily" else "source: yahoo | ")
+            + f"output={output_dir} ---"
         )
 
         if interval == "hourly":
@@ -990,16 +1029,20 @@ class MarketDataGUI(tk.Tk):
         threading.Thread(
             target=self._run_download_worker,
             args=(markets, ticker_selection, exchange_snapshot, start_s, end_s, output_dir,
-                  layout, metastock_ascii, bse_source, bse_adjust),
+                  layout, metastock_ascii, bse_source, bse_adjust, sources),
             daemon=True,
         ).start()
 
     def _run_download_worker(self, markets, ticker_selection, exchange_snapshot,
                               start_s, end_s, output_dir, layout, metastock_ascii,
-                              bse_source="yahoo", bse_adjust=True):
+                              bse_source="yahoo", bse_adjust=True, sources=None):
         try:
             core.start_file_logging(output_dir)
             exchange_map = {}
+            sources = sources or {}
+            # Alpaca / NSE-bhavcopy exchanges bring their own symbol lists (delisted included):
+            # exchange -> None (every symbol) or the selected tickers
+            special = {}
 
             groups = None
             if ticker_selection == "ALL":
@@ -1008,6 +1051,9 @@ class MarketDataGUI(tk.Tk):
                 # one listing shadow the other.
                 groups = {}
                 for m in markets:
+                    if sources.get(m, "yahoo") != "yahoo":
+                        special[m] = None
+                        continue
                     cache_path = CACHE_DIR / f"{m.lower()}_tickers.csv"
                     df = core.fetch_ticker_directory([m], include_etfs=True, cache_path=cache_path,
                                                        refresh=False)
@@ -1027,16 +1073,28 @@ class MarketDataGUI(tk.Tk):
                             f"Search for it via 'Refresh ticker list' first so its exchange is known."
                         )
 
-            if not tickers:
-                raise RuntimeError("No tickers resolved for the selected market(s)/ticker(s).")
-
             # Always one folder per exchange: output_dir/<EXCHANGE>/{raw,daily,
             # by_symbol,combined,bhavcopy}. Unknown-exchange tickers go to UNKNOWN/.
             if groups is None:
                 groups = {}
                 for t in tickers:
                     groups.setdefault(exchange_map.get(t) or "UNKNOWN", []).append(t)
+            for ex in list(groups):
+                if sources.get(ex, "yahoo") != "yahoo":
+                    special[ex] = groups.pop(ex)
+            if not tickers and not special:
+                raise RuntimeError("No tickers resolved for the selected market(s)/ticker(s).")
+
+            n_special = 0
+            for ex, wanted in special.items():
+                if self.cancel_event.is_set():
+                    break
+                n_special += self._run_source(ex, wanted, sources[ex], start_s, end_s, output_dir, layout,
+                                              metastock_ascii)
+
             for ex, ex_tickers in groups.items():
+                if self.cancel_event.is_set():
+                    break
                 core.log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
                 ex_dir = output_dir / ex
                 ex_exchange_map = {t: (None if ex == "UNKNOWN" else ex) for t in ex_tickers}
@@ -1056,8 +1114,9 @@ class MarketDataGUI(tk.Tk):
                            f"Cancelled. Whatever finished downloading is cached under:\n{output_dir}\n"
                            f"Re-run the same settings later to resume and build outputs.")
             else:
+                n_yahoo = sum(len(g) for g in groups.values())
                 self.after(0, self._download_finished, "success",
-                           f"Done -- {len(tickers):,} ticker(s) processed.\nSaved under:\n{output_dir}")
+                           f"Done -- {n_yahoo + n_special:,} ticker(s) processed.\nSaved under:\n{output_dir}")
         except Exception as e:
             core.log.error(f"GUI run failed: {e}")
             self.after(0, self._download_finished, "error", str(e))
@@ -1107,26 +1166,51 @@ class MarketDataGUI(tk.Tk):
             core.log.error(f"GUI hourly run failed: {e}")
             self.after(0, self._download_finished, "error", str(e))
 
+    def _run_source(self, ex, wanted, src, start_s, end_s, output_dir, layout, metastock_ascii) -> int:
+        """Alpaca (NASDAQ/NYSE) or NSE bhavcopy: update the exchange's source folder (all of it, or only
+        `wanted` for Alpaca), then build the outputs from it into the *_alpaca / *_official folders.
+        Returns how many tickers were built."""
+        ex_dir = output_dir / ex
+        what = "every symbol" if wanted is None else f"{len(wanted)} selected ticker(s)"
+        core.log.info(f"=== {ex}: {src} source, {what} ===")
+        self.after(0, self.status_var.set, f"{ex}: updating the {src} data...")
+        try:
+            core.update_source(ex, ex_dir, src, start_s, end_s, download=True, wanted=wanted,
+                               progress_callback=self._on_progress, cancel_event=self.cancel_event)
+        except Exception as e:
+            core.log.error(f"{ex}: updating the {src} data failed ({e}); building from the files already there")
+        if self.cancel_event.is_set():
+            return 0
+        src_dir, tickers = core.source_tickers(ex, ex_dir, src, wanted)
+        if not tickers:
+            core.log.error(f"{ex}: nothing to build from {src_dir}.")
+            return 0
+        self.after(0, self.status_var.set, f"{ex}: building {len(tickers):,} ticker(s)...")
+        self._build_outputs(ex_dir, tickers, {t: ex for t in tickers}, layout, metastock_ascii, start_s, end_s,
+                            output_dir, src_dir=src_dir, suffix=core.SOURCE_FOLDERS[src][1])
+        return len(tickers)
+
     def _build_outputs(self, base_dir, tickers, exchange_map, layout, metastock_ascii, start_s, end_s,
-                       output_root):
+                       output_root, src_dir=None, suffix=""):
         """Runs once, after all downloads for `tickers` have finished -- never
-        incrementally per-ticker, so combining a big batch only happens once."""
-        raw_dir = base_dir / "raw"
+        incrementally per-ticker, so combining a big batch only happens once.
+        src_dir/suffix: build from an Alpaca / NSE-official folder into daily<suffix>/ etc."""
+        raw_dir = src_dir or base_dir / "raw"
         if layout in ("daily", "all"):
-            core.build_daily_csvs(raw_dir, base_dir / "daily", start_s, end_s,
+            core.build_daily_csvs(raw_dir, base_dir / f"daily{suffix}", start_s, end_s,
                                    tickers=tickers, exchange_map=exchange_map,
                                    metastock_ascii=metastock_ascii)
         if layout in ("per-symbol", "all"):
-            core.build_per_symbol_csvs(raw_dir, base_dir / "by_symbol", start_s, end_s,
+            core.build_per_symbol_csvs(raw_dir, base_dir / f"by_symbol{suffix}", start_s, end_s,
                                         tickers=tickers, exchange_map=exchange_map,
                                         metastock_ascii=metastock_ascii)
         if layout in ("combined", "all"):
-            core.build_combined_csv(raw_dir, base_dir / "combined" / "all_data.csv", start_s, end_s,
+            core.build_combined_csv(raw_dir, base_dir / f"combined{suffix}" / "all_data.csv", start_s, end_s,
                                      tickers=tickers, exchange_map=exchange_map,
                                      metastock_ascii=metastock_ascii)
         if self.write_bhavcopy:
             core.build_bhavcopy_files(raw_dir, output_root, start_s, end_s,
-                                      tickers=tickers, exchange_map=exchange_map)
+                                      tickers=tickers, exchange_map=exchange_map, folder=f"bhavcopy{suffix}")
 
     def _on_progress(self, done, total, failed, no_data):
         self.after(0, self._update_progress_ui, done, total, failed, no_data)

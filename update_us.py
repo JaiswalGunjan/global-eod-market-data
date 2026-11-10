@@ -39,20 +39,23 @@ def main():
     ap.add_argument("--hourly-only", action="store_true")
     ap.add_argument("--skip-download", action="store_true", help="No network downloads of bars; reuse the raw caches")
     ap.add_argument("--include-delisted", action="store_true")
-    ap.add_argument("--metastock-ascii", action="store_true")
+    ap.add_argument("--metastock-ascii", action=argparse.BooleanOptionalAction, default=True,
+                    help="MetaStock ASCII output (default); --no-metastock-ascii for the plain layout")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if args.daily_only and args.hourly_only:
         ap.error("--daily-only and --hourly-only are mutually exclusive")
 
     ex = list(args.exchanges)
-    ms = ["--metastock-ascii"] if args.metastock_ascii else []
+    ms = ["--metastock-ascii"] if args.metastock_ascii else ["--no-metastock-ascii"]
     dl = ["--include-delisted"] if args.include_delisted else []
     skip = ["--skip-download"] if args.skip_download else []
 
     if not args.hourly_only:
         log.info("=== daily ===")
-        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, "--layout", "daily", *skip, *ms)
+        # this pipeline is built on the Yahoo raw/ caches (the default US source is Alpaca now)
+        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, "--layout", "daily",
+            "--us-source", "yahoo", *skip, *ms)
         run("us_factors.py", "--root", args.daily_root, "--exchanges", *ex)
         run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, "--layout", "daily",
             "--skip-download", "--price-basis", "raw", *dl, *ms)

@@ -27,7 +27,8 @@ log = logging.getLogger("market_dl")
 COLS = ["Date", "Symbol", "Series", "Open", "High", "Low", "Close", "Volume", "ISIN"]
 
 
-def fetch_day(d: dt.date, cache: Path):
+def fetch_day(d: dt.date, cache: Path, mark_holiday: bool = True):
+    """mark_holiday=False: a 404 is not remembered as a holiday (today's file may simply not be published yet)."""
     f = cache / f"{d:%Y%m%d}.csv"
     if f.exists():
         return d, True
@@ -37,7 +38,8 @@ def fetch_day(d: dt.date, cache: Path):
         except requests.RequestException:
             continue
         if r.status_code == 404:
-            f.write_text(",".join(COLS) + "\n")      # holiday marker
+            if mark_holiday:
+                f.write_text(",".join(COLS) + "\n")      # holiday marker
             return d, True
         if r.status_code != 200:
             continue

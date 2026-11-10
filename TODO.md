@@ -10,7 +10,13 @@
 - [x] Spot-checked daily factors/prices against known splits (2026-10-17): AAPL 4:1, TSLA 5:1+3:1 (x15), NVDA 4:1+10:1 (x40), AMZN/GOOGL 20:1, CMG 50:1, GE 1:8 reverse. As-traded closes match the real pre-split prices. Hourly factors not spot-checked.
 
 ## All exchanges
-- [ ] Dividend / total-return basis; spin-offs and mergers (US).
+- [ ] Dividend / total-return basis.
+- [x] Spin-offs / renames (US): handled in the Alpaca source (`alpaca_us.py`, default since 2026-11-10); still not in the Yahoo US pipeline.
 - [ ] Split-factor as-traded support for LSE, TSX, ASX and other Yahoo exchanges.
 - [ ] GUI controls for `--price-basis raw` and `--include-delisted`.
-- [ ] Stale-cache quirk: `download_ticker()` returns "cached" when an incremental fetch comes back empty.
+- [x] Stale-cache quirk: now reported as "stale".
+- [x] Cached history on an old split basis (Yahoo): `download_ticker()` checks an overlap bar and re-downloads the full history (2026-11-10).
+- [x] GUI source choice (Alpaca / NSE bhavcopy boxes in section 1, on by default; 2026-11-10). MetaStock ASCII is the default everywhere.
+- [ ] Rebuild NASDAQ/NYSE `daily/` and `daily_raw/` over their full range: they are still in the plain layout, and a partial-range run would mix layouts.
+- [ ] `alpaca_us.py`: review `skipped` rows in `<EX>/alpaca_updates.csv` (CDLR 2026-11-05: new security under the ticker, x0.29 price step, likely an ADS ratio change); `alpaca_exits.csv` and `alpaca_1h/` are not extended.
+- [ ] Hourly Yahoo caches (`download_ticker_hourly`) still append without the overlap/basis check.

@@ -337,8 +337,9 @@ def parse_args():
     p.add_argument("--limit", type=int, help="Only the first N tickers per exchange (testing)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--progress-every", type=float, default=60, help="Seconds between progress lines")
-    p.add_argument("--metastock-ascii", action="store_true",
-                   help="Write <TICKER>,<PER>,<DTYYYYMMDD>,<TIME>,O,H,L,C,<VOL> with PER=60, CRLF")
+    p.add_argument("--metastock-ascii", action=argparse.BooleanOptionalAction, default=True,
+                   help="Write <TICKER>,<PER>,<DTYYYYMMDD>,<TIME>,O,H,L,C,<VOL> with PER=60, CRLF (the default; "
+                        "--no-metastock-ascii for the plain Symbol,Datetime,... layout)")
     p.add_argument("--price-basis", choices=["split", "raw"], default="split",
                    help="split = Yahoo's adjusted prices (default). raw = as-traded prices via split factors "
                         "(run us_factors.py --interval hourly first); written to <EX>/as_traded/")

@@ -62,7 +62,8 @@ def rebuild_combined(raw_dir: Path, out_path: Path, start: str, end: str,
 
     for i, f in enumerate(raw_files, start=1):
         try:
-            df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str})
+            # only an empty field is missing: tickers NA, NAN, INF, TRUE ... stay text (Alpaca export has them)
+            df = pd.read_csv(f, parse_dates=["Date"], dtype={"Ticker": str}, keep_default_na=False, na_values=[""])
         except Exception as e:
             log.warning(f"Skipping unreadable file {f.name}: {e}")
             skipped += 1
@@ -132,9 +133,9 @@ def main():
                               "so nothing cached gets filtered out unintentionally.")
     parser.add_argument("--end", default=None,
                          help="Latest date to include (YYYY-MM-DD). Default: today.")
-    parser.add_argument("--metastock-ascii", action="store_true",
-                         help="Write the MetaStock ASCII layout (<TICKER>,<PER>,<DTYYYYMMDD>,... header) "
-                              "instead of the default Symbol,Date,... layout")
+    parser.add_argument("--metastock-ascii", action=argparse.BooleanOptionalAction, default=True,
+                         help="MetaStock ASCII layout (<TICKER>,<PER>,<DTYYYYMMDD>,... header; the default). "
+                              "--no-metastock-ascii writes the plain Symbol,Date,... layout")
     parser.add_argument("--log-every", type=int, default=25,
                          help="Log progress every N files (default: 25). Lower for smaller "
                               "batches, raise for very large raw/ directories.")
