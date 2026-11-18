@@ -41,6 +41,11 @@ History is always on **today's** share basis, also when it was downloaded before
 * **NSE** is rebuilt from the day-file cache whenever a new day or corporate action arrives (about 2 minutes), so
   every earlier price is re-adjusted. The decisions are in `NSE/official_info/events.csv`; moves beyond x1.6 that no
   event explains are listed in `NSE/official_info/gaps.csv` (not adjusted). Hand-kept input: `nse_demergers.csv`.
+  NSE's corporate-actions lists are downloaded once and kept in `NSE/nse_ca/`. nseindia.com is asked again only
+  when a run brings in a new trading day, and then only for the days since the last check (plus a week of overlap
+  for late corrections); new or changed actions are merged into the cache and trigger the rebuild. A run with no
+  new day file makes no corporate-actions request. `python nse_bhavcopy.py --refresh-actions` downloads all
+  quarters again.
 * **Alpaca** files are extended from the second-to-last stored bar. If Alpaca's adjusted price for that day
   changed, and its corporate-actions list has a split or spin-off for the symbol, the stored history is rescaled
   (exact listed ratio). A change no listed event explains (usually a ticker now used by another company, or an ADS
@@ -70,8 +75,8 @@ python eod_gui.py
 
 A window opens with:
 
-1. **Market** — checkboxes for NASDAQ / NYSE / BSE / NSE (NASDAQ+NYSE
-   checked by default; BSE/NSE off by default since they're India-specific)
+1. **Market** — checkboxes for the 16 exchanges (NASDAQ, NYSE and NSE
+   checked on a first start; after that the last choice is remembered)
 2. **Ticker(s)** — leave **ALL** checked (the default) for every ticker in
    the checked market(s), or uncheck it to pick specific ones:
    - Type in the search box — results filter live as you type, no need to
@@ -102,8 +107,11 @@ A window opens with:
      and it covers BSE-only stocks Yahoo can't. See
      [BSE official bhavcopy](#bse-official-bhavcopy-optional-source) below.
    - Cached ticker lists are loaded at startup, so search works immediately.
-3. **Date range** — a calendar picker for start/end (default: last 10 years →
-   today), plus **Quick range** buttons: 1Y / 5Y / 10Y / YTD / Max. **If you're just seeing plain
+3. **Date range** — a calendar picker for start/end, plus **Quick range**
+   buttons: **1D** (the default: start = end = today) / 1W / 1Y / 5Y / 10Y /
+   YTD / Max. The active range is highlighted and is recomputed from today
+   each time the window opens; picking dates by hand switches it off and those
+   dates are remembered instead. The end date is inclusive. **If you're just seeing plain
    YYYY-MM-DD text boxes instead of a calendar dropdown, that means
    `tkcalendar` isn't installed** — run `pip install tkcalendar` and
    restart the app; the plain text fields still work fine in the meantime,
@@ -139,6 +147,48 @@ on small or full-screen windows.
 Closing the window mid-download just stops it — whatever was already
 downloaded stays cached under `raw/`, so re-running later (GUI or CLI)
 picks up where you left off.
+
+### Browser version (`eod_web.py`) and the portable Windows bundle
+
+The same window also runs as a local web page: same sections, defaults,
+messages and remembered settings (`gui_settings.json` is shared).
+
+```bash
+python eod_web.py                # opens http://127.0.0.1:8790/ in the browser
+python eod_web.py --port 0 --no-browser
+```
+
+Keep the console window open while using the page; **Quit app** (top right)
+or closing the console stops it. Differences from the Tk window: dates use the
+browser's date picker (no `tkcalendar` needed), **Browse...** opens an in-page
+folder picker, and a refreshed or reopened tab reconnects to a running download.
+The server only answers on `127.0.0.1` and checks a per-start token, so other
+web sites can't drive it. The default port is 8790 (8765 belongs to the swingbt scan server); if
+the port is busy a free one is used and shown in the console window.
+
+**`eod_config.ini`** (optional, next to the scripts or the exe; template:
+`eod_config.example.ini`) sets the default folders (`daily_output`,
+`hourly_output`, `alpaca_data`, `ticker_cache`) and the web port. Without it
+everything uses the folders next to the scripts, as before. The CLIs read it
+too (their `--output` / `--root` defaults).
+
+**Portable bundle for a PC without Python:**
+
+```bash
+venv\Scripts\python.exe -m pip install -r requirements-build.txt
+venv\Scripts\python.exe build_bundle.py          # --no-keys leaves the Alpaca key files out
+```
+
+This writes `dist/EOD_Market_Data/` and `dist/EOD_Market_Data_<YYYYMMDD>.zip`
+(about 70 MB): `EOD_Market_Data.exe` (the browser app), `cli_daily.exe`,
+`cli_hourly.exe`, `eod_config.ini`, the NSE hand-maintained CSVs,
+this README, `QUICKSTART.txt` (instructions for the recipient) and
+`.alpaca3.env` / `.alpaca2.env`, plus NSE's corporate-actions lists (`seed_data/NSE/nse_ca`, about 8 MB,
+copied from your `<daily_output>/NSE/nse_ca`; the first NSE run takes them into its cache, so nseindia.com is
+only asked about later days). **No price data is included**; the recipient
+points `eod_config.ini` at their own folders. NASDAQ/NYSE use Alpaca only when
+`<daily_output>/<EX>/alpaca/` already has files (copy them over to use it);
+otherwise those exchanges fall back to Yahoo automatically, with a log line.
 
 ## 1. Install requirements (CLI)
 

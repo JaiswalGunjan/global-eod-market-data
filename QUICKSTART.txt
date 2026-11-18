@@ -1,0 +1,50 @@
+EOD Market Data -- quick start (Windows)
+=======================================
+
+Nothing to install: Python and all libraries are inside this folder.
+
+1. Unzip the whole folder somewhere you can write to (e.g. C:\EOD_Market_Data or your Documents).
+   Don't run it from inside the zip file.
+
+2. Double-click EOD_Market_Data.exe.
+   - Windows may say "Windows protected your PC" (the program isn't code-signed):
+     click "More info" -> "Run anyway".
+   - A black console window opens and your browser shows the app at http://127.0.0.1:8790/
+     If the browser doesn't open, copy that address from the console window into it.
+   - Keep the console window open while you use the page. Closing it (or "Quit app" on the page) stops the app.
+
+3. In the page: tick the market(s), pick ALL or search for tickers, choose dates, layout and save
+   location, then click Download. Progress and the log show at the bottom.
+
+Where the data goes
+-------------------
+No data comes with this folder. Edit eod_config.ini (Notepad is fine) to choose the folders:
+
+    daily_output  = D:\MarketData\market_data_daily
+    hourly_output = D:\MarketData\market_data_hourly
+
+You can also pick a folder in the page with "Browse...". If someone gave you a copy of their
+market_data_daily folder, point daily_output at it to reuse that data.
+
+Data sources
+------------
+- NSE: NSE's official bhavcopies. NSE's corporate-actions history (splits, bonuses, ...) comes with this
+  folder (seed_data), so only actions after that date are ever downloaded from nseindia.com.
+- NASDAQ / NYSE: Alpaca when <daily_output>\NYSE\alpaca\ (or NASDAQ\alpaca\) has files; otherwise
+  Yahoo Finance is used automatically (the log says so).
+- Every other exchange: Yahoo Finance.
+
+Command line (optional)
+-----------------------
+Open a Command Prompt in this folder and run, for example:
+
+    cli_daily.exe --help
+    cli_daily.exe --ticker AAPL --ticker-exchange NASDAQ --start 2024-01-01
+    cli_hourly.exe --ticker RELIANCE --ticker-exchange NSE
+
+README.md has the full manual (where it says "python eod_downloader.py", use "cli_daily.exe").
+
+Private files
+-------------
+.alpaca3.env and .alpaca2.env hold Alpaca API keys that were shared with you personally.
+Don't pass them on or upload them anywhere.
