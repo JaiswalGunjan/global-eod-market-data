@@ -18,5 +18,5 @@
 - [x] Cached history on an old split basis (Yahoo): `download_ticker()` checks an overlap bar and re-downloads the full history (2026-11-10).
 - [x] GUI source choice (Alpaca / NSE bhavcopy boxes in section 1, on by default; 2026-11-10). MetaStock ASCII is the default everywhere.
 - [ ] Rebuild NASDAQ/NYSE `daily/` and `daily_raw/` over their full range: they are still in the plain layout, and a partial-range run would mix layouts.
-- [ ] `alpaca_us.py`: review `skipped` rows in `<EX>/alpaca_updates.csv` (CDLR 2026-11-05: new security under the ticker, x0.29 price step, likely an ADS ratio change); `alpaca_exits.csv` and `alpaca_1h/` are not extended.
+- [ ] The Alpaca store ends 2026-10-23: run TranscriptExtract's alpaca_fetch to extend it (EOD no longer updates US bars itself since `alpaca_us.py` was removed 2026-11-18).
 - [ ] Hourly Yahoo caches (`download_ticker_hourly`) still append without the overlap/basis check.

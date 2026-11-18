@@ -1,12 +1,12 @@
 """Backfill NSE symbols that Yahoo no longer serves (delisted / merged / renamed) from NSE's official bhavcopies.
 
-Downloads every trading day's official bhavcopy (cached in <root>/NSE/official_cache/full/), then writes one file per
-symbol that has no usable file in <root>/NSE/raw/:
+Downloads every trading day's official bhavcopy (cached in <root>/NSE/official_raw/full/), then writes one file per
+symbol that has no usable file in <root>/NSE/yahoo_adjusted/:
 
-  <root>/NSE/raw_delisted/NSE.<SYMBOL>.csv   Date,Open,High,Low,Close,Volume,Ticker   (same layout as raw/)
+  <root>/NSE/raw_delisted/NSE.<SYMBOL>.csv   Date,Open,High,Low,Close,Volume,Ticker   (same layout as yahoo_adjusted/)
   <root>/NSE/raw_delisted/isin_map.csv       Symbol,ISIN,First,Last,Days,Successor
 
-Prices here are AS TRADED (not split/bonus adjusted), unlike raw/ which Yahoo adjusts. They are kept in a separate
+Prices here are AS TRADED (not split/bonus adjusted), unlike yahoo_adjusted/ which Yahoo adjusts. They are kept in a separate
 folder so the two bases are never mixed by accident. Successor is the symbol that now carries the same ISIN
 (rename/merger of the same listing), blank if none.
 """
@@ -69,7 +69,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     nse = Path(args.root) / "NSE"
-    raw_dir, cache, out = nse / "raw", nse / "official_cache" / "full", nse / "raw_delisted"
+    raw_dir, cache, out = nse / "yahoo_adjusted", nse / "official_raw" / "full", nse / "raw_delisted"
     cache.mkdir(parents=True, exist_ok=True)
     out.mkdir(exist_ok=True)
 

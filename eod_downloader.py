@@ -60,11 +60,11 @@ USAGE
 OUTPUT
 --------------------------------------------------------------------------
     Everything is kept per exchange, under <output>/<EXCHANGE>/ (e.g. NSE/):
-    <output>/<EX>/raw/<EX>.<TICKER>.csv    one file per ticker (download cache)
-    <output>/<EX>/daily/<YYYYMMDD>.csv     one file per trading day
-    <output>/<EX>/by_symbol/<TICKER>.csv   one file per ticker (--layout per-symbol/all)
-    <output>/<EX>/combined/all_data.csv    all tickers, all dates (--layout combined/all)
-    <output>/<EX>/bhavcopy/<EX>_YYYYMMDD.csv  per-day MetaStock file (unless --no-bhavcopy)
+    <output>/<EX>/yahoo_adjusted/<EX>.<TICKER>.csv    one file per ticker (download cache)
+    <output>/<EX>/daily_adjusted/<YYYYMMDD>.csv     one file per trading day
+    <output>/<EX>/by_symbol_adjusted/<TICKER>.csv   one file per ticker (--layout per-symbol/all)
+    <output>/<EX>/combined_adjusted/all_data.csv    all tickers, all dates (--layout combined/all)
+    <output>/<EX>/bhavcopy_adjusted/<EX>_YYYYMMDD.csv  per-day MetaStock file (unless --no-bhavcopy)
     <output>/tickers.csv                   the ticker list used for this run
 
 By default every CSV is in the MetaStock ASCII layout that MetaStock's
@@ -80,7 +80,7 @@ NYSE.AAPL for NYSE, NSE.TCS for NSE, etc. It falls back to the bare ticker
 (e.g. just "AAPL") when the exchange isn't known -- this happens for
 --ticker mode without --ticker-exchange (CLI), or a manually typed ticker
 that was never looked up via search/refresh (GUI). The raw cache files
-under raw/ are named with the same prefix (NSE.TCS.csv), but the Ticker
+under yahoo_adjusted/ are named with the same prefix (NSE.TCS.csv), but the Ticker
 column inside them is always the bare symbol. What's actually sent to
 Yahoo Finance is yf_download_symbol(): the bare ticker plus the exchange's
 suffix for non-US markets (TCS.NS, VOD.L, ...).
@@ -125,6 +125,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+import app_paths
 import price_basis as _pb
 
 try:
@@ -508,7 +509,7 @@ def load_tickers_from_file(path, exchange: str) -> pd.DataFrame:
 # names) rather than an invented abbreviation, e.g. NASDAQ.AAPL, NYSE.GE,
 # BSE.RELIANCE, NSE.TCS, LSE.VOD, TSE.7203, HKEX.0700, SSE.600519, etc.
 # NOTE: this is purely a display/output convention for the CSVs -- the raw
-# ticker (e.g. "AAPL", "RELIANCE") is what's used for the raw/ download
+# ticker (e.g. "AAPL", "RELIANCE") is what's used for the yahoo_adjusted/ download
 # cache filename; only build_*() output uses this prefix.
 EXCHANGE_PREFIX = {ex: ex for ex in SUPPORTED_EXCHANGES}
 
@@ -593,9 +594,18 @@ def load_cached_range(raw_path: Path):
 
 
 def _yf_fetch(yf_symbol: str, start: str, end: str):
-    """One raw yfinance download (unadjusted, no threads)."""
-    return yf.download(yf_symbol, start=start, end=end, progress=False,
+    """One raw yfinance download (unadjusted, no threads). `end` is inclusive like everywhere else in this tool
+    (the builders keep Date <= end); Yahoo's own end is exclusive, so it gets the day after. Without that a
+    start == end run (the GUI's 1D range) would ask Yahoo for an empty window."""
+    end_excl = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d") if end else None
+    return yf.download(yf_symbol, start=start, end=end_excl, progress=False,
                        auto_adjust=False, threads=False)
+
+
+def _last_weekday(d: pd.Timestamp) -> pd.Timestamp:
+    """d itself on Mon-Fri, else the Friday before (the newest bar a cache can hold for an end date of d)."""
+    d = pd.Timestamp(d).normalize()
+    return d - pd.Timedelta(days=max(0, d.weekday() - 4))
 
 
 def _looks_sparse(data, start: str, end: str) -> bool:
@@ -666,8 +676,8 @@ def download_ticker(ticker: str, start: str, end: str, raw_dir: Path,
     end_dt = pd.Timestamp(end)
 
     cached_min, cached_max = load_cached_range(raw_path)
-    if cached_min is not None and cached_min <= start_dt and cached_max >= end_dt - pd.Timedelta(days=1):
-        return "cached"  # already have this range cached
+    if cached_min is not None and cached_min <= start_dt and cached_max >= _last_weekday(end_dt):
+        return "cached"  # already have this range cached (end is inclusive; weekends hold no bar)
 
     # Incremental case: cache already covers the start, just needs a newer
     # tail. Only fetch the delta and merge it into the existing file. The
@@ -980,7 +990,7 @@ def _bare_ticker_from_filename(stem: str) -> str:
 
 
 def _select_raw_files(raw_dir: Path, tickers=None, exchange_map=None):
-    """Pick which cached raw/<SYMBOL>.csv files to include when building
+    """Pick which cached yahoo_adjusted/<SYMBOL>.csv files to include when building
     output CSVs (filenames are exchange-prefixed when known, e.g.
     NASDAQ.AAPL.csv). If `tickers` is given, only include those specific
     symbols (skipping any that were never downloaded) -- this is what
@@ -1008,7 +1018,7 @@ def _select_raw_files(raw_dir: Path, tickers=None, exchange_map=None):
 
 def _delisted_files(raw_dir: Path, price_basis: str, include_delisted: bool):
     """NSE/BSE: <EX>/raw_delisted/ files (symbols Yahoo no longer serves, from the official bhavcopies); as-traded,
-    so they only mix with the 'raw' price basis. NYSE/NASDAQ: raw/ files of the symbols listed in
+    so they only mix with the 'raw' price basis. NYSE/NASDAQ: yahoo_adjusted/ files of the symbols listed in
     <EX>/delisted_tickers.csv (made by us_factors.py --delisted-file); they go through the normal split factors."""
     if not include_delisted:
         return []
@@ -1117,13 +1127,57 @@ def _exchange_from_filename(stem: str):
     return None
 
 
+class AlpacaSource:
+    """The Alpaca store (market_data_alpaca/) of one exchange, used where the builders expect a folder of cached files:
+    the keys' bars are read from the store's pickles on the fly (alpaca_store.AlpacaStore.load)."""
+
+    def __init__(self, ex: str, ex_dir: Path, store=None):
+        import alpaca_store
+        self.ex, self.parent = ex, Path(ex_dir)
+        self.store = store or alpaca_store.AlpacaStore(daily_root=self.parent.parent)
+
+    def __str__(self):
+        return f"the Alpaca store ({self.store.root})"
+
+
+def _load_store_frames(src, start: str, end: str, tickers, with_exchange: bool, price_basis: str):
+    """_load_raw_frames for an Alpaca store: every key (or only `tickers`, case-insensitive), trimmed to [start, end]."""
+    basis = "raw" if price_basis == "raw" else "adjusted"
+    keys = src.store.keys(src.ex)
+    if tickers:
+        want = {t.upper() for t in tickers}
+        keys = [k for k in keys if k.upper() in want]
+    start_dt, end_dt = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"Reading {len(keys):,} {src.ex} key(s) from the Alpaca store ({basis} prices) ...")
+    progress = _ProgressLog("Reading Alpaca store", len(keys))
+    frames = []
+    for k in keys:
+        progress.step()
+        df = src.store.frame(src.ex, k, basis)
+        if df is None:
+            continue
+        df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
+        if df.empty:
+            continue
+        if with_exchange:
+            df["Exchange"] = src.ex
+        frames.append(df)
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True).dropna(subset=["Open", "High", "Low", "Close"])
+    log.info(f"Merged {len(combined):,} rows across {combined['Date'].nunique():,} trading day(s)")
+    return combined
+
+
 def _load_raw_frames(raw_dir: Path, start: str, end: str, tickers=None, exchange_map=None,
                      with_exchange: bool = False, price_basis: str = "split",
                      include_delisted: bool = False):
-    """Read the selected raw/ cache files, trim to [start, end], and return one
+    """Read the selected yahoo_adjusted/ cache files, trim to [start, end], and return one
     DataFrame (or None if there's nothing). with_exchange=True adds an
     Exchange column taken from each file's name prefix. price_basis="raw"
     converts to as-traded prices; include_delisted adds <EX>/raw_delisted/."""
+    if isinstance(raw_dir, AlpacaSource):
+        return _load_store_frames(raw_dir, start, end, tickers, with_exchange, price_basis)
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
     frames = []
@@ -1204,10 +1258,10 @@ def build_daily_csvs(raw_dir: Path, daily_dir: Path, start: str, end: str,
 
 def build_bhavcopy_files(raw_dir: Path, out_root: Path, start: str, end: str,
                          tickers=None, exchange_map=None, price_basis: str = "split",
-                         include_delisted: bool = False, folder: str = "bhavcopy"):
+                         include_delisted: bool = False, folder: str = "bhavcopy_adjusted"):
     """Bhavcopy-style output: one MetaStock ASCII file per exchange per
     trading day holding every downloaded stock's OHLCV for that day, at
-    out_root/<EXCHANGE>/bhavcopy/<EXCHANGE>_<YYYYMMDD>.csv -- inside each
+    out_root/<EXCHANGE>/bhavcopy_adjusted/<EXCHANGE>_<YYYYMMDD>.csv -- inside each
     exchange's own folder, so the same bare ticker on e.g. NSE and BSE never
     collides.
 
@@ -1245,7 +1299,7 @@ def build_bhavcopy_files(raw_dir: Path, out_root: Path, start: str, end: str,
             n_written += 1
         log.info(f"Bhavcopy: {ex} -- {ex_rows['Date'].nunique():,} day file(s), "
                  f"{len(run_symbols):,} symbol(s) -> {ex_dir}")
-    log.info(f"Done building {n_written:,} bhavcopy file(s) under {out_root}/<EXCHANGE>/bhavcopy")
+    log.info(f"Done building {n_written:,} bhavcopy file(s) under {out_root}/<EXCHANGE>/{folder}")
 
 
 def build_combined_csv(raw_dir: Path, out_path: Path, start: str, end: str,
@@ -1372,10 +1426,13 @@ def parse_args():
                          "any exchange. Needs a Symbol column (a Name column is optional). Use "
                          "with --exchanges to say which exchange these tickers belong to, e.g. "
                          "--ticker-file bse_list.csv --exchanges BSE")
-    p.add_argument("--output", default="./market_data_daily", help="Output root folder")
-    p.add_argument("--layout", choices=["daily", "per-symbol", "combined", "all"], default="daily",
-                    help="Output layout: one file per day, one per symbol, one single "
-                         "clubbed CSV with everything, or all three")
+    p.add_argument("--output", default=str(app_paths.daily_output()),
+                   help="Output root folder (default: daily_output in eod_config.ini, else ./market_data_daily)")
+    p.add_argument("--layout", type=_layout_arg, default="none",
+                    help="Extra output besides the day files in bhavcopy_adjusted/ (bhavcopy_raw/ with --price-basis "
+                         "raw), which are built unless --no-bhavcopy: 'none' (default, writes nothing else) or "
+                         "'combined' = also one combined_adjusted/all_data.csv (combined_raw/). The old values "
+                         "daily / per-symbol / all are accepted and mean combined.")
     p.add_argument("--skip-download", action="store_true",
                     help="Skip downloading; just rebuild CSVs from existing raw cache")
     p.add_argument("--refresh-tickers", action="store_true",
@@ -1411,7 +1468,7 @@ def parse_args():
                          "per trading day (cached under <output>/bhavcopy_cache) so a first "
                          "10-year run takes a while.")
     p.add_argument("--no-bhavcopy", action="store_true",
-                    help="Don't write the per-day bhavcopy files (<output>/<EXCHANGE>/bhavcopy/"
+                    help="Don't write the per-day bhavcopy files (<output>/<EXCHANGE>/bhavcopy_adjusted/"
                          "<EXCHANGE>_YYYYMMDD.csv, MetaStock ASCII, every stock for that day). "
                          "They're built after every run by default, whatever --layout is.")
     p.add_argument("--no-split-adjust", action="store_true",
@@ -1428,28 +1485,42 @@ def parse_args():
                         "(delisted/merged names, as-traded; made by nse_delisted.py) and NYSE/NASDAQ "
                         "symbols listed in <EX>/delisted_tickers.csv (made by us_factors.py --delisted-file).")
     p.add_argument("--us-source", choices=["alpaca", "yahoo"], default=None,
-                   help="Where NASDAQ/NYSE prices come from. 'alpaca' (default) = <EX>/alpaca/: Alpaca SIP bars "
-                        "incl. delisted companies, splits and spin-offs back-adjusted (seeded by TranscriptExtract's "
-                        "alpaca_export, extended to the latest day by alpaca_us.py unless --skip-download); every "
-                        "key is built into daily_alpaca/, by_symbol_alpaca/, combined_alpaca/, bhavcopy_alpaca/. "
-                        "'yahoo' = the Yahoo raw/ cache (the default with --price-basis raw).")
+                   help="Where NASDAQ/NYSE prices come from. 'alpaca' (default) = the Alpaca store market_data_alpaca/ "
+                        "(SIP bars incl. delisted companies; splits and spin-offs back-adjusted, or as traded with "
+                        "--price-basis raw), read directly and kept up to date by TranscriptExtract's alpaca_fetch; "
+                        "every key is built into combined_adjusted/ (combined_raw/) and bhavcopy_adjusted/ "
+                        "(bhavcopy_raw/). 'yahoo' = the Yahoo yahoo_adjusted/ cache.")
     p.add_argument("--nse-source", choices=["bhavcopy", "yahoo"], default=None,
                    help="Where NSE prices come from. 'bhavcopy' (default) = NSE's official day files, back-adjusted "
                         "with NSE's corporate-actions list (splits, bonuses, rights, demergers; renames joined, "
-                        "delisted/merged companies kept) by nse_bhavcopy.py into NSE/official/; built into "
-                        "daily_official/, by_symbol_official/, combined_official/, bhavcopy_official/. "
-                        "'yahoo' = the Yahoo raw/ cache (the default with --price-basis raw).")
+                        "delisted/merged companies kept) by nse_bhavcopy.py into NSE/official_adjusted/; built into "
+                        "combined_adjusted/ and bhavcopy_adjusted/. "
+                        "'yahoo' = the Yahoo yahoo_adjusted/ cache (the default with --price-basis raw).")
     args = p.parse_args()
     if args.include_delisted and args.price_basis != "raw":
         p.error("--include-delisted requires --price-basis raw")
-    # the as-traded pipeline (price_basis.py factors, raw_delisted/) is built on the Yahoo caches
-    for name, special in (("us_source", "alpaca"), ("nse_source", "bhavcopy")):
-        if getattr(args, name) is None:
-            setattr(args, name, "yahoo" if args.price_basis == "raw" else special)
-        elif getattr(args, name) == special and args.price_basis == "raw":
-            p.error(f"--{name.replace('_', '-')} {special} is already adjusted and has no as-traded basis here; "
-                    f"drop --price-basis raw or use --{name.replace('_', '-')} yahoo")
+    # NSE's as-traded pipeline (price_basis.py factors, raw_delisted/) is built on the Yahoo caches; the Alpaca store
+    # holds as-traded bars itself, so NASDAQ/NYSE keep their source with --price-basis raw
+    if args.us_source is None:
+        args.us_source = "alpaca"
+    if args.nse_source is None:
+        args.nse_source = "yahoo" if args.price_basis == "raw" else "bhavcopy"
+    elif args.nse_source == "bhavcopy" and args.price_basis == "raw":
+        p.error("--nse-source bhavcopy is already adjusted and has no as-traded basis here; "
+                "drop --price-basis raw or use --nse-source yahoo")
     return args
+
+
+def _layout_arg(value: str) -> str:
+    """--layout: 'none' (the default) or 'combined'; the per-day and per-symbol folders were dropped."""
+    if value not in ("none", "combined", "daily", "per-symbol", "all"):
+        raise argparse.ArgumentTypeError(f"invalid layout {value!r} (use none or combined)")
+    return "none" if value == "none" else "combined"
+
+
+def _as_raw(name: str) -> str:
+    """daily_adjusted -> daily_raw (the as-traded twin of an adjusted output folder)."""
+    return (name[: -len("_adjusted")] if name.endswith("_adjusted") else name) + "_raw"
 
 
 def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_dir, combined_path,
@@ -1473,53 +1544,63 @@ def _download_and_build(tickers, exchange_map, raw_dir, daily_dir, per_symbol_di
     basis = dict(price_basis=args.price_basis, include_delisted=args.include_delisted)
     if args.price_basis == "raw":
         # keep as-traded output apart from the adjusted files
-        daily_dir = daily_dir.with_name(daily_dir.name + "_raw")
-        per_symbol_dir = per_symbol_dir.with_name(per_symbol_dir.name + "_raw")
-        combined_path = combined_path.parent.with_name(combined_path.parent.name + "_raw") / combined_path.name
-    if args.layout in ("daily", "all"):
-        build_daily_csvs(raw_dir, daily_dir, args.start, args.end, args.date_format,
-                          tickers=tickers, exchange_map=exchange_map,
-                          metastock_ascii=args.metastock_ascii, **basis)
-    if args.layout in ("per-symbol", "all"):
-        build_per_symbol_csvs(raw_dir, per_symbol_dir, args.start, args.end, args.date_format,
-                               tickers=tickers, exchange_map=exchange_map,
-                               metastock_ascii=args.metastock_ascii, **basis)
-    if args.layout in ("combined", "all"):
+        combined_path = combined_path.parent.with_name(_as_raw(combined_path.parent.name)) / combined_path.name
+    if args.layout == "combined":
         build_combined_csv(raw_dir, combined_path, args.start, args.end, args.date_format,
                             tickers=tickers, exchange_map=exchange_map,
                             metastock_ascii=args.metastock_ascii, **basis)
     if not args.no_bhavcopy:
         build_bhavcopy_files(raw_dir, out_root, args.start, args.end,
                              tickers=tickers, exchange_map=exchange_map, **basis,
-                             folder=bhav_folder or ("bhavcopy_raw" if args.price_basis == "raw" else "bhavcopy"))
+                             folder=bhav_folder or ("bhavcopy_raw" if args.price_basis == "raw" else "bhavcopy_adjusted"))
 
 
 ALPACA_EXCHANGES = ("NASDAQ", "NYSE")
 # source -> (folder under <EX>/ holding the adjusted per-symbol files, suffix of the output folders)
-SOURCE_FOLDERS = {"alpaca": ("alpaca", "_alpaca"), "bhavcopy": ("official", "_official")}
+SOURCE_FOLDERS = {"alpaca": (None, "_adjusted"), "bhavcopy": ("official_adjusted", "_adjusted")}   # None = the store
 
 
-def source_of(ex, args) -> str:
-    """'alpaca' (NASDAQ/NYSE), 'bhavcopy' (NSE) or 'yahoo' (everything else, or when chosen)."""
+def source_of(ex, args, out_root=None) -> str:
+    """'alpaca' (NASDAQ/NYSE), 'bhavcopy' (NSE) or 'yahoo' (everything else, or when chosen).
+    out_root given: an Alpaca exchange with no Alpaca files under it falls back to Yahoo (effective_source)."""
     if ex in ALPACA_EXCHANGES:
-        return args.us_source
-    if ex == "NSE":
-        return args.nse_source
+        src = args.us_source
+    elif ex == "NSE":
+        src = args.nse_source
+    else:
+        src = "yahoo"
+    return effective_source(ex, Path(out_root) / ex, src) if out_root is not None else src
+
+
+_fallback_warned = set()
+
+
+def effective_source(ex, ex_dir: Path, src: str) -> str:
+    """The source actually used: 'alpaca' needs the Alpaca store (market_data_alpaca/ with meta_<EX>.csv and the daily
+    pickles), so without it the exchange uses Yahoo. NSE bhavcopy downloads from scratch and is returned unchanged."""
+    if src != "alpaca":
+        return src
+    import alpaca_store
+    if alpaca_store.AlpacaStore(daily_root=Path(ex_dir).parent).available(ex):
+        return src
+    key = (ex, str(alpaca_store.store_dir()))
+    if key not in _fallback_warned:
+        _fallback_warned.add(key)
+        log.warning(f"{ex}: no Alpaca store at {alpaca_store.store_dir()} -- using Yahoo for {ex} instead (set "
+                    f"alpaca_data in eod_config.ini to a market_data_alpaca folder to use Alpaca).")
     return "yahoo"
 
 
 def update_source(ex, ex_dir: Path, src: str, start: str, end: str, download: bool = True, wanted=None,
                   progress_callback=None, cancel_event=None):
-    """Bring <EX>/alpaca/ (src 'alpaca') or NSE/official/ (src 'bhavcopy') up to date. Shared by the CLI and the
-    GUI. download=False: Alpaca does nothing, NSE rebuilds offline if its caches changed. wanted (Alpaca): update
-    only these tickers (fast single-ticker runs; a ticker with no file yet is fetched in full). Raises on failure."""
+    """Bring the source up to date: NSE/official_adjusted/ (src 'bhavcopy'). Shared by the CLI and the GUI.
+    download=False: NSE rebuilds offline if its caches changed. Alpaca: nothing to do here -- the store
+    (market_data_alpaca/) is downloaded and extended by TranscriptExtract's swingbt.data_fetch.alpaca_fetch.
+    Raises on failure."""
     if src == "alpaca":
-        if not download:
-            return
-        import alpaca_us
-        alpaca_us.update_exchange(ex, Path(ex_dir) / "alpaca", alpaca_us.connect(), end=end,
-                                  universe_csv=Path(__file__).resolve().parent / "market_data_alpaca" / "universe.csv",
-                                  keys=wanted, progress_callback=progress_callback, cancel_event=cancel_event)
+        import alpaca_store
+        last = alpaca_store.AlpacaStore(daily_root=Path(ex_dir).parent).meta(ex)["last"].max()
+        log.info(f"{ex}: the Alpaca store runs to {last.date()} (extend it with TranscriptExtract's alpaca_fetch)")
     elif src == "bhavcopy":
         import nse_bhavcopy
         nse_bhavcopy.update(ex_dir, start=start, end=end, download=download,
@@ -1529,31 +1610,47 @@ def update_source(ex, ex_dir: Path, src: str, start: str, end: str, download: bo
 
 
 def source_tickers(ex, ex_dir: Path, src: str, wanted=None, limit=None):
-    """(source folder, tickers to build) for an Alpaca / NSE-bhavcopy exchange: every file's key (delisted and
-    merged companies included), or only `wanted` (case-insensitive). Empty list if the folder has no files."""
-    src_dir = Path(ex_dir) / SOURCE_FOLDERS[src][0]
-    files = sorted(src_dir.glob(f"{ex}.*.csv")) if src_dir.is_dir() else []
-    tickers = [f.stem.split(".", 1)[1] for f in files]
+    """(source, tickers to build) for an Alpaca / NSE-bhavcopy exchange: every key (delisted and merged companies
+    included), or only `wanted` (case-insensitive). The source is an AlpacaSource (the store) or the NSE folder.
+    Empty list if there is nothing."""
+    if src == "alpaca":
+        src_dir = AlpacaSource(ex, ex_dir)
+        tickers = src_dir.store.keys(ex) if src_dir.store.available(ex) else []
+        where, files = src_dir.store.root, tickers
+    else:
+        src_dir = Path(ex_dir) / SOURCE_FOLDERS[src][0]
+        files = sorted(src_dir.glob(f"{ex}.*.csv")) if src_dir.is_dir() else []
+        tickers = [f.stem.split(".", 1)[1] for f in files]
+        where = src_dir
     if wanted is not None:
         want = {t.upper() for t in wanted}
         tickers = [t for t in tickers if t.upper() in want]
         missing = sorted(want - {t.upper() for t in tickers})
         if missing:
-            log.warning(f"{ex}: no {src} data for {missing[:10]}{' ...' if len(missing) > 10 else ''} in {src_dir}")
+            log.warning(f"{ex}: no {src} data for {missing[:10]}{' ...' if len(missing) > 10 else ''} in {where}")
     if limit:
         tickers = tickers[:limit]
     if not files:
-        log.error(f"{ex}: no files in {src_dir} -- "
-                  + ("seed it once with TranscriptExtract's `py -m swingbt.data_fetch.alpaca_export`"
+        log.error(f"{ex}: nothing in {where} -- "
+                  + ("it needs TranscriptExtract's alpaca_fetch download (meta_<EX>.csv and daily/<EX>/*.pkl)"
                      if src == "alpaca" else "run once with downloading switched on") + ".")
     return src_dir, tickers
 
 
+def write_alpaca_exits(ex, ex_dir: Path):
+    """<EX>/alpaca_exits.csv from the store's meta (what a holder got after each key's last bar)."""
+    try:
+        n = AlpacaSource(ex, ex_dir).store.write_exits(ex, Path(ex_dir) / "alpaca_exits.csv")
+        log.info(f"{ex}: wrote {n:,} rows to alpaca_exits.csv")
+    except Exception as e:
+        log.warning(f"{ex}: alpaca_exits.csv not written ({e})")
+
+
 def _build_from_source(ex, ex_dir, wanted, out_root, args):
     """CLI: Alpaca (NASDAQ/NYSE) and NSE bhavcopy -- update the source folder (update_source), then build the usual
-    layouts from its files into *_alpaca / *_official output folders. wanted: None = every symbol, else only these
+    layouts from its files into *_adjusted output folders. wanted: None = every symbol, else only these
     tickers (--ticker / --ticker-file)."""
-    src = source_of(ex, args)
+    src = source_of(ex, args, out_root)
     try:
         update_source(ex, ex_dir, src, args.start, args.end, download=not args.skip_download, wanted=wanted)
     except Exception as e:
@@ -1564,9 +1661,11 @@ def _build_from_source(ex, ex_dir, wanted, out_root, args):
         return
     suffix = SOURCE_FOLDERS[src][1]
     log.info(f"=== {ex}: {len(tickers)} ticker(s) from {src_dir} ({src}) ===")
+    if src == "alpaca":
+        write_alpaca_exits(ex, ex_dir)
     _download_and_build(tickers, {t: ex for t in tickers}, src_dir, ex_dir / f"daily{suffix}",
                         ex_dir / f"by_symbol{suffix}", ex_dir / f"combined{suffix}" / "all_data.csv", out_root, args,
-                        bhav_folder=f"bhavcopy{suffix}", download=False)
+                        download=False)
 
 
 def main():
@@ -1586,10 +1685,10 @@ def main():
 
     ticker_arg = normalize_ticker_input(args.ticker or "ALL")
     exchange_map = {}
-    log.info("Sources: " + ", ".join(f"{ex}={source_of(ex, args)}" for ex in args.exchanges))
+    log.info("Sources: " + ", ".join(f"{ex}={source_of(ex, args, out_root)}" for ex in args.exchanges))
     # NASDAQ/NYSE from Alpaca and NSE from its bhavcopies bring their own symbol lists (delisted included), so no
     # Yahoo-style ticker directory is fetched for them -- unless a --ticker-file narrows them down.
-    own_list = [ex for ex in args.exchanges if source_of(ex, args) != "yahoo"]
+    own_list = [ex for ex in args.exchanges if source_of(ex, args, out_root) != "yahoo"]
     special = {}                               # exchange -> None (every symbol) or the wanted tickers
     groups = {}
     if ticker_arg == "ALL" and not args.ticker_file:
@@ -1631,13 +1730,13 @@ def main():
                       f"suffix to find it at all, not just for display) -- pass "
                       f"--ticker-exchange, e.g. NSE, LSE, HKEX (see --help for the full list).")
 
-    # Every exchange gets its own folder: <output>/<EXCHANGE>/{raw,daily,
+    # Every exchange gets its own folder: <output>/<EXCHANGE>/{yahoo_adjusted,daily_adjusted,
     # by_symbol,combined,bhavcopy}. Tickers with no known exchange go to UNKNOWN/.
     if ticker_arg != "ALL":
         groups = {exchange_map.get(ticker_arg) or "UNKNOWN": [ticker_arg]}
     # a --ticker-file / --ticker on an Alpaca or bhavcopy exchange narrows that source to those symbols
     for ex in list(groups):
-        if ex in SUPPORTED_EXCHANGES and source_of(ex, args) != "yahoo":
+        if ex in SUPPORTED_EXCHANGES and source_of(ex, args, out_root) != "yahoo":
             special[ex] = groups.pop(ex)
     if args.price_basis == "raw":
         others = sorted(set(groups) - _pb.FACTOR_EXCHANGES)
@@ -1652,8 +1751,8 @@ def main():
         ex_exchange_map = {t: (None if ex == "UNKNOWN" else ex) for t in ex_tickers}
         _download_and_build(
             ex_tickers, ex_exchange_map,
-            ex_dir / "raw", ex_dir / "daily", ex_dir / "by_symbol",
-            ex_dir / "combined" / "all_data.csv", out_root, args,
+            ex_dir / "yahoo_adjusted", ex_dir / "daily_adjusted", ex_dir / "by_symbol_adjusted",
+            ex_dir / "combined_adjusted" / "all_data.csv", out_root, args,
         )
 
     log.info("All done.")

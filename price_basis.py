@@ -1,6 +1,6 @@
 """Price-basis conversion for the build step (--price-basis raw).
 
-raw/ caches hold Yahoo's retroactively split/bonus/rights-adjusted prices ("split" basis). For NSE,
+yahoo_adjusted/ caches hold Yahoo's retroactively split/bonus/rights-adjusted prices ("split" basis). For NSE,
 nse_factors.py derives exact per-date scale factors (<EX>/recon/scale_factors.csv) so that
     as_traded_price  = yahoo_price  * Factor
     as_traded_volume = yahoo_volume / Factor

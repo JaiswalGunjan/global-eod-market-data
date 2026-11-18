@@ -1,12 +1,12 @@
-"""Derive as-traded scale factors for BSE by comparing the cached raw/ closes with BSE's official (unadjusted) closes.
+"""Derive as-traded scale factors for BSE by comparing the cached yahoo_adjusted/ closes with BSE's official (unadjusted) closes.
 
 as_traded_price = raw_price * Factor          (volume: as_traded_volume = raw_volume / Factor)
 
-Needs <root>/BSE/bhavcopy_cache/ (run bse_delisted.py first) and the live scrips' raw/BSE.<TICKER>.csv, whether those
+Needs <root>/BSE/bhavcopy_cache/ (run bse_delisted.py first) and the live scrips' yahoo_adjusted/BSE.<TICKER>.csv, whether those
 came from Yahoo or from the bhavcopy source. Writes under <root>/BSE/recon/ (same files as nse_factors.py):
 scale_factors.csv, factor_outliers.csv, factor_check.csv. After this, eod_downloader.py --price-basis raw works for BSE.
 Scrips are matched by their latest ticker, so symbols that were renamed before mid-2024 only get factors under the
-current ticker (raw/ is keyed by that anyway).
+current ticker (yahoo_adjusted/ is keyed by that anyway).
 """
 import argparse
 import logging
@@ -27,7 +27,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     bse = Path(args.root) / "BSE"
-    raw_dir, out = bse / "raw", bse / "recon"
+    raw_dir, out = bse / "yahoo_adjusted", bse / "recon"
     out.mkdir(exist_ok=True)
 
     log.info("Loading official closes ...")
@@ -38,7 +38,7 @@ def main():
            .assign(Date=lambda d: d.Date.dt.strftime("%Y-%m-%d"))
            .drop_duplicates(["Symbol", "Date"], keep="last").set_index(["Symbol", "Date"]).Close)
 
-    log.info("Loading raw/ ...")
+    log.info("Loading yahoo_adjusted/ ...")
     frames = []
     for p in raw_dir.glob("BSE.*.csv"):
         if p.stat().st_size < 30:

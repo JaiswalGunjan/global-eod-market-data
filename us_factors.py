@@ -125,7 +125,7 @@ def _read_bars(path: Path, hourly: bool):
 
 def build_exchange(root: Path, exchange: str, hourly: bool, max_age_days: int, workers: int):
     ex_dir = root / exchange
-    raw_dir = ex_dir / ("raw_1h" if hourly else "raw")
+    raw_dir = ex_dir / ("raw_1h" if hourly else "yahoo_adjusted")
     prefix = f"{core.EXCHANGE_PREFIX[exchange]}."
     files = {p.stem[len(prefix):]: p for p in raw_dir.glob(f"{prefix}*.csv") if p.stat().st_size > 30}
     if not files:
@@ -179,7 +179,7 @@ def fetch_delisted(root: Path, exchange: str, hourly: bool, list_file: str, star
         hourly_mod.download_all_hourly([(s, exchange) for s in syms], root, workers)
         raw_dir = hourly_mod.raw_dir_for(root, exchange)
     else:
-        raw_dir = root / exchange / "raw"
+        raw_dir = root / exchange / "yahoo_adjusted"
         core.download_all(syms, start, date.today().isoformat(), raw_dir, exchange_map={s: exchange for s in syms},
                           max_workers=workers)
     have = [s for s in syms if (raw_dir / f"{core.prefixed_symbol(s, exchange)}.csv").exists()

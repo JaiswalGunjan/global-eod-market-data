@@ -32,9 +32,9 @@ extra step needed.
 
 | Exchange | Source | Updated by | Adjusted for | Output folders |
 |---|---|---|---|---|
-| NASDAQ, NYSE | Alpaca (SIP feed), delisted companies included | `alpaca_us.py` → `<EX>/alpaca/` | splits, reverse splits, spin-offs (not dividends) | `daily_alpaca/`, `by_symbol_alpaca/`, `combined_alpaca/`, `bhavcopy_alpaca/` |
-| NSE | NSE's official bhavcopies + NSE's corporate-actions list, delisted/merged companies included | `nse_bhavcopy.py` → `NSE/official/` | splits, bonuses, rights, demergers, big special dividends; renames joined (TATAMOTORS → TMPV) | `daily_official/`, `by_symbol_official/`, `combined_official/`, `bhavcopy_official/` |
-| everything else | Yahoo Finance | `download_ticker()` → `<EX>/raw/` | splits (Yahoo's own adjustment) | `daily/`, `by_symbol/`, `combined/`, `bhavcopy/` |
+| NASDAQ, NYSE | Alpaca (SIP feed), delisted companies included | the Alpaca store `market_data_alpaca/` (read by `alpaca_store.py`) | splits, reverse splits, spin-offs (not dividends) | `daily_adjusted/`, `by_symbol_adjusted/`, `combined_adjusted/`, `bhavcopy_adjusted/` |
+| NSE | NSE's official bhavcopies + NSE's corporate-actions list, delisted/merged companies included | `nse_bhavcopy.py` → `NSE/official_adjusted/` | splits, bonuses, rights, demergers, big special dividends; renames joined (TATAMOTORS → TMPV) | `daily_adjusted/`, `by_symbol_adjusted/`, `combined_adjusted/`, `bhavcopy_adjusted/` |
+| everything else | Yahoo Finance | `download_ticker()` → `<EX>/yahoo_adjusted/` | splits (Yahoo's own adjustment) | `daily_adjusted/`, `by_symbol_adjusted/`, `combined_adjusted/`, `bhavcopy_adjusted/` |
 
 History is always on **today's** share basis, also when it was downloaded before the event:
 
@@ -58,13 +58,12 @@ History is always on **today's** share basis, also when it was downloaded before
 python eod_downloader.py --exchanges NSE NASDAQ NYSE --layout daily   # update + build (MetaStock ASCII by default)
 python eod_downloader.py --exchanges NSE --skip-download                                 # offline rebuild
 python nse_bhavcopy.py            # NSE source only (download + adjusted rebuild)
-python alpaca_us.py               # US source only (needs .alpaca2.env / .alpaca3.env or APCA_API_* variables)
 ```
 
 `--us-source yahoo` / `--nse-source yahoo` bring back the old Yahoo sources (and they stay the default with
 `--price-basis raw`, the as-traded pipeline in section 6).
 
-**GUI:** section 1 has two **Data sources** boxes, both ticked by default: *NASDAQ / NYSE from Alpaca* and *NSE from NSE's official bhavcopies*. With ALL ticked, every symbol of that source is built (delisted ones too); with picked tickers, only those are updated and built (a US ticker takes seconds; NSE still checks for new day files and rebuilds `NSE/official/` when something changed, about 2 minutes). Untick a box to use Yahoo for that market instead. The progress bar and Cancel work during these steps. Hourly mode always uses Yahoo (the boxes are greyed out).
+**GUI:** section 1 has two **Data sources** boxes, both ticked by default: *NASDAQ / NYSE from Alpaca* and *NSE from NSE's official bhavcopies*. With ALL ticked, every symbol of that source is built (delisted ones too); with picked tickers, only those are updated and built (a US ticker takes seconds; NSE still checks for new day files and rebuilds `NSE/official_adjusted/` when something changed, about 2 minutes). Untick a box to use Yahoo for that market instead. The progress bar and Cancel work during these steps. Hourly mode always uses Yahoo (the boxes are greyed out).
 
 ## 0. GUI (recommended)
 
@@ -122,8 +121,8 @@ A window opens with:
      [section 4](#4-about-the-metastock-format)); untick for the plain
      `Symbol,Date,...` layout
    - Data is always saved per exchange: each exchange gets its own
-     `<save location>/<EXCHANGE>/` folder with its own `raw/` cache and
-     `daily/`/`by_symbol/`/`combined/`/`bhavcopy/` output
+     `<save location>/<EXCHANGE>/` folder with its own `yahoo_adjusted/` cache and
+     `daily_adjusted/`/`by_symbol_adjusted/`/`combined_adjusted/`/`bhavcopy_adjusted/` output
    - **Hourly** (NSE/NASDAQ/NYSE only, last ~2 years from Yahoo) writes one
      file per exchange per hour, `<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv`,
      with every ticker's bar for that hour (see `hourly_downloader.py`)
@@ -145,7 +144,7 @@ the settings area scrolls, and the log pane is resizable, so nothing gets hidden
 on small or full-screen windows.
 
 Closing the window mid-download just stops it — whatever was already
-downloaded stays cached under `raw/`, so re-running later (GUI or CLI)
+downloaded stays cached under `yahoo_adjusted/`, so re-running later (GUI or CLI)
 picks up where you left off.
 
 ### Browser version (`eod_web.py`) and the portable Windows bundle
@@ -183,11 +182,11 @@ This writes `dist/EOD_Market_Data/` and `dist/EOD_Market_Data_<YYYYMMDD>.zip`
 (about 70 MB): `EOD_Market_Data.exe` (the browser app), `cli_daily.exe`,
 `cli_hourly.exe`, `eod_config.ini`, the NSE hand-maintained CSVs,
 this README, `QUICKSTART.txt` (instructions for the recipient) and
-`.alpaca3.env` / `.alpaca2.env`, plus NSE's corporate-actions lists (`seed_data/NSE/nse_ca`, about 8 MB,
+plus NSE's corporate-actions lists (`seed_data/NSE/nse_ca`, about 8 MB,
 copied from your `<daily_output>/NSE/nse_ca`; the first NSE run takes them into its cache, so nseindia.com is
 only asked about later days). **No price data is included**; the recipient
 points `eod_config.ini` at their own folders. NASDAQ/NYSE use Alpaca only when
-`<daily_output>/<EX>/alpaca/` already has files (copy them over to use it);
+the Alpaca store (`alpaca_data` in `eod_config.ini`, a `market_data_alpaca/` folder) exists;
 otherwise those exchanges fall back to Yahoo automatically, with a log line.
 
 ## 1. Install requirements (CLI)
@@ -257,7 +256,7 @@ python eod_downloader.py --exchanges BSE --ticker-file bse_list.csv --layout com
 
 Every exchange is always downloaded into its own folder
 (`market_data_daily/NASDAQ/...`, `market_data_daily/NYSE/...`, each with its own
-`raw/` cache and its own combined file) -- for any combination of exchanges:
+`yahoo_adjusted/` cache and its own combined file) -- for any combination of exchanges:
 
 ```bash
 python eod_downloader.py --exchanges NSE BSE --layout combined
@@ -341,7 +340,7 @@ python eod_downloader.py --exchanges BSE --bse-source bhavcopy --no-split-adjust
 
 - **How**: one file per trading day is downloaded and cached in
   `<output>/bhavcopy_cache/` (weekends/holidays are detected and skipped), then
-  stitched into the usual `raw/BSE.<TICKER>.csv` files, so every layout and the
+  stitched into the usual `yahoo_adjusted/BSE.<TICKER>.csv` files, so every layout and the
   MetaStock format work unchanged. Works back to at least 2016.
 - **Speed**: roughly 250 day-files per ~40 s on a cold cache, so a first
   10-year run takes about 6-7 minutes (plus ~10 min of Yahoo split look-ups for
@@ -368,22 +367,22 @@ market_data_daily/
 ├── tickers.csv                  # the ticker list used
 ├── logs/                        # one log file per run
 ├── NASDAQ/
-│   ├── raw/                     # one cache file per ticker (download cache, keep this)
+│   ├── yahoo_adjusted/                     # one cache file per ticker (download cache, keep this)
 │   │   ├── NASDAQ.AAPL.csv
 │   │   └── ...
-│   ├── daily/                   # one file per trading day (NASDAQ tickers only)
+│   ├── daily_adjusted/                   # one file per trading day (NASDAQ tickers only)
 │   │   ├── 20160115.csv
 │   │   └── ...
-│   ├── by_symbol/               # optional, see "Metastock format" below
+│   ├── by_symbol_adjusted/               # optional, see "Metastock format" below
 │   ├── combined/all_data.csv    # optional: every NASDAQ ticker + date in ONE file
-│   └── bhavcopy/                # always built (unless --no-bhavcopy), MetaStock ASCII
+│   └── bhavcopy_adjusted/                # always built (unless --no-bhavcopy), MetaStock ASCII
 │       ├── NASDAQ_20240102.csv  # every downloaded stock for that day
 │       └── ...
 ├── NYSE/                        # same structure
 └── NSE/                         # same structure
 ```
 
-`bhavcopy/` mirrors the BSE/NSE bhavcopy idea for every exchange: each day's
+`bhavcopy_adjusted/` mirrors the BSE/NSE bhavcopy idea for every exchange: each day's
 file holds all stocks for that day, already in MetaStock ASCII format, so you
 can point MetaStock's Downloader at a folder and convert day by day. It
 accumulates across runs -- downloading one more stock adds/updates just that
@@ -475,7 +474,7 @@ It falls back to the bare ticker (just `AAPL`) when the exchange isn't known:
   why) — and for NSE/BSE, the download itself will fail without a known
   exchange, not just the prefix.
 
-This only affects the *output* CSVs — the `raw/` download cache always uses
+This only affects the *output* CSVs — the `yahoo_adjusted/` download cache always uses
 the bare ticker internally as its canonical form (Yahoo's required
 `.NS`/`.BO` suffix is added only for the actual API request, not stored
 anywhere else).
@@ -530,7 +529,7 @@ python eod_downloader.py --layout per-symbol --metastock-ascii
 ```
 
 or `--layout all` to get every layout in the same run. The per-symbol files
-land in `by_symbol/<SYMBOL>.csv` (e.g. `NASDAQ.AAPL.csv`), named after the same
+land in `by_symbol_adjusted/<SYMBOL>.csv` (e.g. `NASDAQ.AAPL.csv`), named after the same
 exchange-prefixed symbol used inside the file.
 
 **Recommendation**: test with a small run first (`--limit 3` or a couple
@@ -580,14 +579,14 @@ ticker download.
 
 ## 6. Backtesting-grade NSE data (as-traded prices, delisted names, corporate actions)
 
-Yahoo's cached prices (`raw/`) are **retroactively adjusted** for later splits, bonuses and rights
+Yahoo's cached prices (`yahoo_adjusted/`) are **retroactively adjusted** for later splits, bonuses and rights
 issues (e.g. HDFCBANK in 2016 shows ₹320 instead of the ₹1,282 that actually traded), and symbols
 that were delisted or merged away are missing. For NSE this can be corrected from NSE's official
 daily bhavcopy. Run the steps in order; all of them are offline-resumable (downloads are cached).
 
 | Step | Command | Output (under `<output>/NSE/`) |
 |---|---|---|
-| 1. Download official bhavcopies, backfill symbols Yahoo no longer serves | `python nse_delisted.py` | `official_cache/full/`, `raw_delisted/NSE.<SYM>.csv`, `raw_delisted/isin_map.csv` |
+| 1. Download official bhavcopies, backfill symbols Yahoo no longer serves | `python nse_delisted.py` | `official_raw/full/`, `raw_delisted/NSE.<SYM>.csv`, `raw_delisted/isin_map.csv` |
 | 2. Derive exact scale factors (Yahoo price → as-traded price) | `python nse_factors.py` | `recon/scale_factors.csv`, `factor_outliers.csv`, `factor_check.csv` |
 | 3. Validate rename chains (same ISIN, new symbol) | `python nse_stitch.py` | `raw_delisted/stitch_report.csv` |
 | 4. Build the corporate-actions table | `python nse_corporate_actions.py` | `corporate_actions.csv`, `recon/merger_check.csv` |

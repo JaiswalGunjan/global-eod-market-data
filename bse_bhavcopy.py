@@ -6,7 +6,7 @@ BSE official bhavcopy -> per-symbol history
 An alternative to Yahoo Finance for BSE tickers. BSE publishes one "bhavcopy"
 file per trading day (every security's OHLCV); this module downloads those
 day files, caches each one, and stitches them into the same per-symbol
-`raw/BSE.<TICKER>.csv` files the rest of the pipeline already reads.
+`yahoo_adjusted/BSE.<TICKER>.csv` files the rest of the pipeline already reads.
 
 Why: Yahoo's BSE (.BO) history is patchy, and BSE-only stocks have no NSE
 listing to fall back on. The official files cover every BSE security.
@@ -336,7 +336,7 @@ def latest_ticker_by_code(off: pd.DataFrame) -> dict:
 def download_bse(tickers, start: str, end: str, raw_dir: Path, cache_dir: Path = None,
                  max_workers: int = 8, progress_callback=None, cancel_event=None,
                  adjust_splits: bool = True) -> dict:
-    """Build raw/BSE.<TICKER>.csv for each ticker from BSE's official daily
+    """Build yahoo_adjusted/BSE.<TICKER>.csv for each ticker from BSE's official daily
     files, for [start, end) (end exclusive, like yfinance).
 
     progress_callback(done, total, failed, no_data) is called per day-file

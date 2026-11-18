@@ -2,7 +2,7 @@
 rebuild_combined.py
 --------------------
 Rebuilds <EXCHANGE>/combined/all_data.csv from whatever is already cached
-in <EXCHANGE>/raw/ under market_data_daily/ -- for every exchange folder
+in <EXCHANGE>/yahoo_adjusted/ under market_data_daily/ -- for every exchange folder
 found, or just --exchange -- with no network access, no re-download.
 
 Reimplements build_combined_csv()'s per-file loop locally (rather than
@@ -120,12 +120,12 @@ def rebuild_combined(raw_dir: Path, out_path: Path, start: str, end: str,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default="./market_data_daily",
-                         help="Daily data root holding one <EXCHANGE>/raw/ folder per exchange")
+                         help="Daily data root holding one <EXCHANGE>/yahoo_adjusted/ folder per exchange")
     parser.add_argument("--exchange", default=None,
                          help="Only rebuild this exchange (e.g. NSE). Default: every exchange "
-                              "folder under --root that has a raw/ cache")
+                              "folder under --root that has a yahoo_adjusted/ cache")
     parser.add_argument("--raw-dir", default=None,
-                         help="Explicit raw/ folder (overrides --root/--exchange; needs --out)")
+                         help="Explicit yahoo_adjusted/ folder (overrides --root/--exchange; needs --out)")
     parser.add_argument("--out", default=None,
                          help="Output path for the combined CSV when --raw-dir is given")
     parser.add_argument("--start", default="2000-01-01",
@@ -138,7 +138,7 @@ def main():
                               "--no-metastock-ascii writes the plain Symbol,Date,... layout")
     parser.add_argument("--log-every", type=int, default=25,
                          help="Log progress every N files (default: 25). Lower for smaller "
-                              "batches, raise for very large raw/ directories.")
+                              "batches, raise for very large yahoo_adjusted/ directories.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -156,10 +156,10 @@ def main():
     else:
         root = Path(args.root)
         ex_dirs = [root / args.exchange.upper()] if args.exchange else sorted(
-            p for p in root.iterdir() if (p / "raw").is_dir())
-        jobs = [(d / "raw", d / "combined" / "all_data.csv") for d in ex_dirs]
+            p for p in root.iterdir() if (p / "yahoo_adjusted").is_dir())
+        jobs = [(d / "yahoo_adjusted", d / "combined_adjusted" / "all_data.csv") for d in ex_dirs]
     if not jobs:
-        raise SystemExit(f"No <EXCHANGE>/raw/ folders found under {Path(args.root).resolve()}")
+        raise SystemExit(f"No <EXCHANGE>/yahoo_adjusted/ folders found under {Path(args.root).resolve()}")
 
     for raw_dir, out_path in jobs:
         if not raw_dir.exists():

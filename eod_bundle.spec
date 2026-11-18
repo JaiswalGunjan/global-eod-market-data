@@ -9,7 +9,7 @@ datas = [("web", "web")]
 binaries = []
 hiddenimports = [
     # imported lazily inside functions
-    "nse_bhavcopy", "alpaca_us", "bse_bhavcopy", "nse_delisted", "reconcile_nse", "price_basis",
+    "nse_bhavcopy", "alpaca_store", "bse_bhavcopy", "nse_delisted", "reconcile_nse", "price_basis",
 ]
 for pkg in ("curl_cffi", "yfinance"):           # curl_cffi ships yfinance's native libcurl
     d, b, h = collect_all(pkg)

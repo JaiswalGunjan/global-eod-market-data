@@ -9,7 +9,7 @@ A simple desktop window on top of eod_downloader.py that lets you pick:
                      NASDAQ + NYSE checked)
     2. Ticker      - a specific symbol, or "ALL" (default) for every ticker
                      in the selected market(s), with type-to-filter
-    3. Date range  - start / end (default: last 10 years -> today)
+    3. Date range  - start / end, quick ranges 1D (default: today -> today), 1W, 1Y, 5Y, 10Y, YTD, Max
     4. CSV layout  - one file per day / per symbol / one combined file / all
     5. Save folder - any location on disk, via a folder picker
 
@@ -47,30 +47,25 @@ NOTES
 - Closing the window while a download is running stops it; whatever was
   already downloaded stays cached, so re-running later resumes from there.
 - Data sources (section 1, both on by default): NASDAQ/NYSE from Alpaca
-  (<EX>/alpaca/, brought up to date by alpaca_us.py) and NSE from NSE's
-  official bhavcopies (NSE/official/, nse_bhavcopy.py). Both are kept
+  (read from the market_data_alpaca/ store) and NSE from NSE's
+  official bhavcopies (NSE/official_adjusted/, nse_bhavcopy.py). Both are kept
   adjusted for splits / spin-offs / demergers and include delisted
-  companies; their outputs go to *_alpaca / *_official folders (daily_alpaca,
-  bhavcopy_official, ...). Untick them to use Yahoo instead. Every other
+  companies; their outputs go to *_adjusted folders (daily_adjusted,
+  bhavcopy_adjusted, ...). Untick them to use Yahoo instead. Every other
   exchange, and the Hourly interval, always use Yahoo.
 """
 
 import json
 import logging
-import os
 import queue
-import subprocess
-import sys
 import threading
 import tkinter as tk
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import pandas as pd
-
+import eod_app as appcore  # the window's logic without UI (shared with the browser app, eod_web.py)
 import eod_downloader as core  # reuse all download/build logic
-import hourly_downloader as hourly  # 1h bars (NSE/NASDAQ/NYSE, Yahoo's ~730-day window)
 
 try:
     from tkcalendar import DateEntry
@@ -78,18 +73,11 @@ try:
 except ImportError:
     HAS_TKCALENDAR = False  # falls back to typed YYYY-MM-DD fields, see date frame below
 
-CACHE_DIR = Path(__file__).resolve().parent / ".ticker_cache"
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = appcore.CACHE_DIR  # ticker_cache in eod_config.ini, default .ticker_cache next to this script
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = CACHE_DIR / "gui_settings.json"  # remembered GUI choices, see _save_settings()
-EARLIEST_DATE = date(1990, 1, 1)  # what the "Max" date preset starts from
-
-
-def _years_ago(years: int) -> date:
-    today = date.today()
-    try:
-        return today.replace(year=today.year - years)
-    except ValueError:  # Feb 29 -> a non-leap target year
-        return today.replace(year=today.year - years, day=28)
+EARLIEST_DATE = appcore.EARLIEST_DATE  # what the "Max" date preset starts from
+_years_ago = appcore.years_ago
 
 
 # --------------------------------------------------------------------------
@@ -107,17 +95,7 @@ class QueueLogHandler(logging.Handler):
         self.log_queue.put(self.format(record))
 
 
-def _open_folder(path: Path):
-    """Open a folder in the OS file browser. Best-effort, never raises."""
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # noqa: S606 (Windows-only API)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
-    except Exception:
-        pass
+_open_folder = appcore.open_folder  # best-effort, never raises
 
 
 # --------------------------------------------------------------------------
@@ -149,8 +127,16 @@ class MarketDataGUI(tk.Tk):
         # exchange may be None for a manually-typed ticker we don't have data for.
         self.selected_tickers = {}
         self.is_running = False
-        self.cancel_event = threading.Event()
+        # the download/build logic lives in eod_app.Runner; its callbacks run on the worker thread, so each
+        # one hands over to Tk with after()
+        self.runner = appcore.Runner(
+            on_progress=self._on_progress,
+            on_status=lambda text: self.after(0, self.status_var.set, text),
+            on_finished=lambda status, msg: self.after(0, self._download_finished, status, msg),
+            cache_dir=CACHE_DIR)
+        self.cancel_event = self.runner.cancel_event
         self.last_output_dir = None
+        self.write_bhavcopy = True
 
         self._build_widgets()
         self._load_cached_tickers()
@@ -214,7 +200,7 @@ class MarketDataGUI(tk.Tk):
         # else off by default since most need extra setup (bulk fetch isn't
         # auto-fetchable -- see "Load tickers from file...") rather than
         # "just working" the way NASDAQ/NYSE/NSE do.
-        self.market_vars = {ex: tk.BooleanVar(value=(ex in ("NASDAQ", "NYSE")))
+        self.market_vars = {ex: tk.BooleanVar(value=(ex in appcore.DEFAULT_MARKETS))
                              for ex in core.SUPPORTED_EXCHANGES}
         PER_ROW = 6
         exchanges = list(self.market_vars.items())
@@ -253,15 +239,15 @@ class MarketDataGUI(tk.Tk):
         self.us_alpaca_var = tk.BooleanVar(value=True)
         self.us_alpaca_check = ttk.Checkbutton(
             market_frame,
-            text="NASDAQ / NYSE from Alpaca (latest bars; output in <EX>/daily_alpaca, bhavcopy_alpaca, ...)",
+            text="NASDAQ / NYSE from the Alpaca store (output in <EX>/combined_adjusted, bhavcopy_adjusted)",
             variable=self.us_alpaca_var,
         )
         self.us_alpaca_check.pack(anchor="w", padx=10, pady=(0, 2))
         self.nse_official_var = tk.BooleanVar(value=True)
         self.nse_official_check = ttk.Checkbutton(
             market_frame,
-            text="NSE from NSE's official bhavcopies + corporate actions (output in NSE/daily_official, "
-                 "bhavcopy_official, ...)",
+            text="NSE from NSE's official bhavcopies + corporate actions (output in NSE/combined_adjusted, "
+                 "bhavcopy_adjusted)",
             variable=self.nse_official_var,
         )
         self.nse_official_check.pack(anchor="w", padx=10, pady=(0, 2))
@@ -336,7 +322,9 @@ class MarketDataGUI(tk.Tk):
         date_row = ttk.Frame(date_frame)
         date_row.pack(fill="x")
         today = datetime.today()
-        default_start = _years_ago(10)  # matches the README's "last 10 years"
+        default_start = today.date()  # the default quick range is 1D: today -> today
+        # the chosen quick range ("" = dates picked by hand); a saved range is recomputed from today on start
+        self.date_preset_var = tk.StringVar(value=appcore.DEFAULT_PRESET)
 
         # HAS_TKCALENDAR only means the import succeeded -- actually
         # constructing a DateEntry can still fail at runtime for reasons
@@ -362,7 +350,8 @@ class MarketDataGUI(tk.Tk):
             self.start_var = None
         else:
             self.start_var = tk.StringVar(value=default_start.strftime("%Y-%m-%d"))
-            ttk.Entry(date_row, textvariable=self.start_var, width=12).pack(side="left", pady=8)
+            self.start_date_widget = ttk.Entry(date_row, textvariable=self.start_var, width=12)
+            self.start_date_widget.pack(side="left", pady=8)
 
         ttk.Label(date_row, text="End:").pack(side="left", padx=10)
         if self.has_date_picker:
@@ -372,24 +361,22 @@ class MarketDataGUI(tk.Tk):
             self.end_var = None
         else:
             self.end_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
-            ttk.Entry(date_row, textvariable=self.end_var, width=12).pack(side="left", pady=8)
+            self.end_date_widget = ttk.Entry(date_row, textvariable=self.end_var, width=12)
+            self.end_date_widget.pack(side="left", pady=8)
+        # picking or typing a date by hand leaves the quick range
+        for w in (self.start_date_widget, self.end_date_widget):
+            w.bind("<KeyRelease>", self._on_manual_date, add="+")
+            w.bind("<<DateEntrySelected>>", self._on_manual_date, add="+")
 
-        # Quick ranges: set start to N years back (or Jan 1 / the earliest
-        # date) and end to today.
+        # Quick ranges (eod_app.date_presets): start = today / 1 week / N years back / Jan 1 / the earliest
+        # date, end = today. Shown as toggle buttons so the active one (1D by default) stays visible.
         preset_row = ttk.Frame(date_frame)
         preset_row.pack(fill="x", pady=(0, 6))
         ttk.Label(preset_row, text="Quick range:").pack(side="left", padx=10)
-        presets = [
-            ("1Y", lambda: _years_ago(1)),
-            ("5Y", lambda: _years_ago(5)),
-            ("10Y", lambda: _years_ago(10)),
-            ("YTD", lambda: date(date.today().year, 1, 1)),
-            ("Max", lambda: EARLIEST_DATE),
-        ]
-        for label, start_fn in presets:
-            ttk.Button(preset_row, text=label, width=5,
-                       command=lambda fn=start_fn: self._set_dates(fn(), date.today())
-                       ).pack(side="left", padx=2)
+        for label, _start in appcore.date_presets():
+            ttk.Radiobutton(preset_row, text=label, width=5, style="Toolbutton", value=label,
+                            variable=self.date_preset_var, command=self._apply_preset
+                            ).pack(side="left", padx=2)
 
         if not self.has_date_picker:
             msg = "(install 'tkcalendar' for a calendar picker: pip install tkcalendar)"
@@ -402,13 +389,8 @@ class MarketDataGUI(tk.Tk):
         # 4. CSV layout
         layout_frame = ttk.LabelFrame(body, text="4. CSV layout")
         layout_frame.pack(fill="x", **pad)
-        self.layout_var = tk.StringVar(value="combined")
-        options = [
-            ("One file per day", "daily"),
-            ("One file per symbol", "per-symbol"),
-            ("Single combined file", "combined"),
-            ("All of the above", "all"),
-        ]
+        self.layout_var = tk.StringVar(value="none")
+        options = [("Day files only (bhavcopy_adjusted)", "none"), ("Also one combined file", "combined")]
         interval_row = ttk.Frame(layout_frame)
         interval_row.pack(fill="x")
         ttk.Label(interval_row, text="Data interval:").pack(side="left", padx=(8, 4), pady=(8, 2))
@@ -451,8 +433,7 @@ class MarketDataGUI(tk.Tk):
         out_frame.pack(fill="x", **pad)
         # One save location per interval (swapped by _on_interval_change), so
         # daily and hourly data never land in the same folder.
-        self.output_paths = {"daily": str(Path.cwd() / "market_data_daily"),
-                             "hourly": str(Path.cwd() / "market_data_hourly")}
+        self.output_paths = appcore.default_output_paths()  # daily_output / hourly_output in eod_config.ini
         self.output_var = tk.StringVar(value=self.output_paths["daily"])
         ttk.Entry(out_frame, textvariable=self.output_var).pack(
             side="left", padx=(10, 6), pady=8, fill="x", expand=True
@@ -495,16 +476,7 @@ class MarketDataGUI(tk.Tk):
         """Populate the symbol/name search from the on-disk ticker caches at
         startup, so search works immediately (incl. BSE) instead of needing
         'Refresh ticker list' every session."""
-        for ex in core.SUPPORTED_EXCHANGES:
-            path = CACHE_DIR / f"{ex.lower()}_tickers.csv"
-            if not path.exists():
-                continue
-            try:
-                df = pd.read_csv(path, dtype=str).fillna("")
-                names = df["Name"] if "Name" in df.columns else [""] * len(df)
-                self.all_tickers[ex] = dict(zip(df["Symbol"], names))
-            except Exception:
-                continue  # unreadable/odd cache: just skip, Refresh rebuilds it
+        self.all_tickers = appcore.load_cached_tickers(CACHE_DIR)
 
     def _collect_settings(self) -> dict:
         today_str = date.today().strftime("%Y-%m-%d")
@@ -516,6 +488,7 @@ class MarketDataGUI(tk.Tk):
             "start": self._get_start_date_str(),
             "end": end_s,
             "end_is_today": end_s == today_str,  # so a saved "today" doesn't go stale
+            "date_preset": self.date_preset_var.get(),  # recomputed from today on the next start
             "layout": self.layout_var.get(),
             "interval": self.interval_var.get(),
             "metastock_ascii": self.metastock_ascii_var.get(),
@@ -543,13 +516,7 @@ class MarketDataGUI(tk.Tk):
         state = "disabled" if hourly_mode else "normal"
         for w in (*self.layout_radios, self.bhavcopy_check, self.us_alpaca_check, self.nse_official_check):
             w.config(state=state)
-        self.interval_note_var.set(
-            "Hourly: Yahoo only has the last ~730 days of 1h bars. Output goes to "
-            "<save location>/<EXCHANGE>/<EXCHANGE>_YYYYMMDD_HHMM.csv (all tickers for one hour per "
-            "file). Re-run regularly -- each run "
-            "appends new bars, so the cached history grows past 2 years. Only NSE, NASDAQ and NYSE "
-            "tickers are downloaded, all from Yahoo (the Alpaca / NSE bhavcopy sources are daily only)."
-            if hourly_mode else "")
+        self.interval_note_var.set(appcore.HOURLY_NOTE if hourly_mode else "")
 
     def _current_output_paths(self) -> dict:
         """output_paths with the field's (possibly just edited) value applied."""
@@ -559,10 +526,7 @@ class MarketDataGUI(tk.Tk):
         return paths
 
     def _save_settings(self):
-        try:
-            SETTINGS_PATH.write_text(json.dumps(self._collect_settings(), indent=2), encoding="utf-8")
-        except Exception:
-            pass  # remembering settings is a convenience; never block on it
+        appcore.save_settings(self._collect_settings(), SETTINGS_PATH)  # never raises
 
     def _load_settings(self):
         try:
@@ -575,10 +539,10 @@ class MarketDataGUI(tk.Tk):
             self.ticker_all_var.set(bool(s.get("all", True)))
             self.selected_tickers = {sym: (n, ex) for sym, (n, ex) in s.get("selected", {}).items()}
             self._refresh_selected_listbox()
-            start = datetime.strptime(s["start"], "%Y-%m-%d").date()
-            end = date.today() if s.get("end_is_today") else datetime.strptime(s["end"], "%Y-%m-%d").date()
+            start, end, preset = appcore.saved_dates(s)
+            self.date_preset_var.set(preset)
             self._set_dates(start, end)
-            self.layout_var.set(s.get("layout", "combined"))
+            self.layout_var.set(s.get("layout") if s.get("layout") in ("none", "combined") else "none")
             self.interval_var.set(s.get("interval", "daily"))
             self._on_interval_change()
             self.metastock_ascii_var.set(bool(s.get("metastock_ascii", True)))
@@ -605,7 +569,7 @@ class MarketDataGUI(tk.Tk):
 
     def _attach_log_handler(self):
         handler = QueueLogHandler(self.log_queue)
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        handler.setFormatter(appcore.LOG_FORMAT)
         core.log.addHandler(handler)
         core.log.setLevel(logging.INFO)
 
@@ -635,12 +599,10 @@ class MarketDataGUI(tk.Tk):
 
     # ------------------------------------------------------------ Ticker --
 
-    ENTRY_SEP = " — "  # separates "SYMBOL" from "Company Name" in list entries
+    ENTRY_SEP = appcore.ENTRY_SEP  # separates "SYMBOL" from "Company Name" in list entries
 
     def _format_entry(self, symbol, name, exchange=None):
-        display_symbol = core.prefixed_symbol(symbol, exchange) if exchange else symbol
-        name = (name or "").strip()
-        return f"{display_symbol}{self.ENTRY_SEP}{name}" if name else display_symbol
+        return appcore.format_entry(symbol, name, exchange)
 
     def _current_ticker_map(self):
         """{symbol: name} for every symbol in the currently checked market(s)."""
@@ -692,24 +654,9 @@ class MarketDataGUI(tk.Tk):
     # -- live search (updates as you type, no dropdown/click needed) ------
 
     def _apply_ticker_filter(self):
-        typed = self.ticker_search_var.get().strip().upper()
-        entries = self._current_ticker_entries()
-
-        if typed:
-            # Search the bare symbol, the exchange-prefixed symbol (so typing
-            # "NASDAQ.AAPL" works too), and the company name -- so "APPLE",
-            # "AAPL", and "NASDAQ.AAPL" all find the same entry.
-            matches = [
-                (s, n, ex) for s, n, ex in entries
-                if s.upper().startswith(typed)
-                or typed in (n or "").upper()
-                or core.prefixed_symbol(s, ex).upper().startswith(typed)
-            ]
-            matches.sort(key=lambda e: (not e[0].upper().startswith(typed), e[0]))
-        else:
-            matches = sorted(entries, key=lambda e: e[0])
-
-        self.filtered_entries = matches[:300]
+        # symbol, NASDAQ.AAPL-style prefixed symbol and company name all match (eod_app.search)
+        self.filtered_entries = appcore.search(self.all_tickers, self._selected_markets(),
+                                               self.ticker_search_var.get())
         self.filter_listbox.delete(0, "end")
         for s, n, ex in self.filtered_entries:
             self.filter_listbox.insert("end", self._format_entry(s, n, ex))
@@ -720,25 +667,14 @@ class MarketDataGUI(tk.Tk):
         self._apply_ticker_filter()  # live: fires on every keystroke
 
     def _on_search_entry_return(self, event=None):
-        typed = self.ticker_search_var.get().strip().upper()
-        if not typed:
+        typed = self.ticker_search_var.get()
+        action = appcore.resolve_search_return(typed, self.filtered_entries)
+        if action is None:
             return
-        exact = next((e for e in self.filtered_entries if e[0] == typed), None)
-        if exact:
-            self._select_ticker(*exact)
-        elif len(self.filtered_entries) == 1:
-            self._select_ticker(*self.filtered_entries[0])
-        elif self.filtered_entries:
-            messagebox.showinfo(
-                "Multiple matches",
-                f"{len(self.filtered_entries)} matches for '{typed}' -- select the one(s) "
-                "you want from the list on the left and click Add ▸ (or double-click one)."
-            )
+        if action[0] == "multiple":
+            messagebox.showinfo("Multiple matches", appcore.multiple_matches_message(typed, action[1]))
             return
-        else:
-            # No matches in our loaded directory -- treat as a raw custom
-            # ticker (e.g. a brand-new IPO we haven't cached), exchange unknown.
-            self._select_ticker(typed, "", None)
+        self._select_ticker(*action[1])
         self.ticker_search_var.set("")
         self._apply_ticker_filter()
         self._refresh_selected_listbox()
@@ -785,18 +721,8 @@ class MarketDataGUI(tk.Tk):
 
     def _display_text_to_symbol(self, text: str) -> str:
         """Recover the bare ticker (the actual key in self.selected_tickers)
-        from a listbox row's display text, e.g. 'NASDAQ.AAPL — Apple Inc. ...'
-        -> 'AAPL'. Reading straight from the widget instead of indexing into
-        a separately-tracked list of dict keys avoids any chance of the two
-        getting out of sync."""
-        if self.ENTRY_SEP in text:
-            text = text.split(self.ENTRY_SEP, 1)[0]
-        text = text.strip()
-        for prefix in core.EXCHANGE_PREFIX.values():
-            lead = f"{prefix}."
-            if text.startswith(lead):
-                return text[len(lead):]
-        return text
+        from a listbox row's display text, e.g. 'NASDAQ.AAPL - Apple Inc. ...' -> 'AAPL'."""
+        return appcore.display_text_to_symbol(text)
 
     def _remove_selected_selection(self):
         idxs = self.selected_listbox.curselection()
@@ -858,15 +784,8 @@ class MarketDataGUI(tk.Tk):
 
     def _do_refresh_tickers(self, markets):
         try:
-            bse_empty = False
-            for m in markets:
-                cache_path = CACHE_DIR / f"{m.lower()}_tickers.csv"
-                df = core.fetch_ticker_directory(
-                    [m], include_etfs=True, cache_path=cache_path, refresh=True
-                )
-                self.all_tickers[m] = dict(zip(df["Symbol"], df["Name"]))
-                if m == "BSE" and df.empty:
-                    bse_empty = True
+            got, bse_empty = appcore.refresh_tickers(markets, CACHE_DIR)
+            self.all_tickers.update(got)
             self.after(0, self._on_tickers_refreshed, bse_empty)
         except Exception as e:
             self.after(0, self._on_tickers_refresh_failed, str(e))
@@ -877,20 +796,23 @@ class MarketDataGUI(tk.Tk):
         self._refresh_selected_listbox()
         self._update_ticker_status()
         if bse_empty:
-            messagebox.showinfo(
-                "Couldn't fetch the BSE list",
-                "The BSE ticker list couldn't be downloaded automatically (BSE's site may be "
-                "down or have changed -- see the log for details).\n\n"
-                "You can still use 'Load tickers from file...' with a BSE list you export "
-                "yourself (bseindia.com/corporates/List_Scrips.aspx), or just search/type "
-                "individual BSE tickers directly (e.g. TCS)."
-            )
+            messagebox.showinfo("Couldn't fetch the BSE list", appcore.BSE_EMPTY_MESSAGE)
 
     def _on_tickers_refresh_failed(self, msg):
         self.refresh_button.config(state="normal", text="Refresh ticker list")
         messagebox.showerror("Failed to fetch ticker list", str(msg))
 
     # --------------------------------------------------------- Date range --
+
+    def _apply_preset(self):
+        rng = appcore.preset_range(self.date_preset_var.get())
+        if rng:
+            self._set_dates(*rng)
+
+    def _on_manual_date(self, event=None):
+        rng = appcore.preset_range(self.date_preset_var.get())
+        if rng and (self._get_start_date_str(), self._get_end_date_str()) != tuple(d.isoformat() for d in rng):
+            self.date_preset_var.set("")
 
     def _set_dates(self, start: date, end: date):
         for d, widget_attr, var in ((start, "start_date_widget", self.start_var),
@@ -947,61 +869,27 @@ class MarketDataGUI(tk.Tk):
     def _start_download(self):
         markets = self._selected_markets()
         all_mode = self.ticker_all_var.get()
-
+        interval = self.interval_var.get()
+        problem, output_dir = appcore.validate_run(
+            markets, all_mode, self.selected_tickers, self._get_start_date_str(), self._get_end_date_str(),
+            self.output_var.get(), self.output_paths[interval], interval)
+        if problem:
+            kind, title, msg = problem
+            (messagebox.showwarning if kind == "warning" else messagebox.showerror)(title, msg)
+            return
         if all_mode:
-            if not markets:
-                messagebox.showwarning("No market selected",
-                                        "Please select at least one market (NASDAQ, NYSE, BSE, NSE), "
-                                        "or uncheck ALL and pick specific ticker(s) instead.")
-                return
             ticker_selection = "ALL"
             exchange_snapshot = {}
         else:
-            if not self.selected_tickers:
-                messagebox.showwarning(
-                    "No tickers selected",
-                    "Please select at least one ticker: search, then click Add ▸ (or "
-                    "double-click a match) -- or check ALL instead."
-                )
-                return
             ticker_selection = list(self.selected_tickers.keys())
             exchange_snapshot = {s: ex for s, (n, ex) in self.selected_tickers.items()}
-
         start_s, end_s = self._get_start_date_str(), self._get_end_date_str()
-        try:
-            start_dt = datetime.strptime(start_s, "%Y-%m-%d")
-            end_dt = datetime.strptime(end_s, "%Y-%m-%d")
-        except ValueError:
-            messagebox.showerror("Invalid date", "Please enter dates as YYYY-MM-DD.")
-            return
-        if start_dt > end_dt:
-            messagebox.showerror("Invalid date range", "Start date must be before end date.")
-            return
-
-        output_dir = Path(self.output_var.get().strip() or self.output_paths[self.interval_var.get()])
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            messagebox.showerror("Can't create output folder", str(e))
-            return
-
         layout = self.layout_var.get()
-        interval = self.interval_var.get()
-        if interval == "hourly":
-            chosen = markets if all_mode else set(exchange_snapshot.values())
-            if not set(chosen) & set(hourly.HOURLY_EXCHANGES):
-                messagebox.showwarning(
-                    "Hourly not available",
-                    "Hourly data is only available for NSE, NASDAQ and NYSE. "
-                    "Select one of those markets (or tickers from them).")
-                return
         metastock_ascii = self.metastock_ascii_var.get()
         bse_source = "bhavcopy" if self.bse_bhavcopy_var.get() else "yahoo"
         bse_adjust = self.bse_adjust_var.get()
         # exchange -> source, snapshot for the worker (which must not read Tk vars)
-        sources = {"NASDAQ": "alpaca" if self.us_alpaca_var.get() else "yahoo",
-                   "NYSE": "alpaca" if self.us_alpaca_var.get() else "yahoo",
-                   "NSE": "bhavcopy" if self.nse_official_var.get() else "yahoo"}
+        sources = appcore.Runner.sources(self.us_alpaca_var.get(), self.nse_official_var.get())
         self.write_bhavcopy = self.bhavcopy_var.get()  # snapshot: worker thread must not read Tk vars
         self.last_output_dir = output_dir
         self._save_settings()
@@ -1033,184 +921,18 @@ class MarketDataGUI(tk.Tk):
             daemon=True,
         ).start()
 
+    # The workers run on daemon threads; the logic is eod_app.Runner's (shared with the browser app).
     def _run_download_worker(self, markets, ticker_selection, exchange_snapshot,
                               start_s, end_s, output_dir, layout, metastock_ascii,
                               bse_source="yahoo", bse_adjust=True, sources=None):
-        try:
-            core.start_file_logging(output_dir)
-            exchange_map = {}
-            sources = sources or {}
-            # Alpaca / NSE-bhavcopy exchanges bring their own symbol lists (delisted included):
-            # exchange -> None (every symbol) or the selected tickers
-            special = {}
-
-            groups = None
-            if ticker_selection == "ALL":
-                # One group per market, straight from that market's own directory: the same symbol can
-                # be listed on several (INFY/HAL on NSE and NYSE) and a symbol->exchange dict would let
-                # one listing shadow the other.
-                groups = {}
-                for m in markets:
-                    if sources.get(m, "yahoo") != "yahoo":
-                        special[m] = None
-                        continue
-                    cache_path = CACHE_DIR / f"{m.lower()}_tickers.csv"
-                    df = core.fetch_ticker_directory([m], include_etfs=True, cache_path=cache_path,
-                                                       refresh=False)
-                    groups[m] = sorted(set(df.loc[df["Exchange"] == m, "Symbol"]))
-                tickers = sorted({t for g in groups.values() for t in g})
-            else:
-                tickers = list(ticker_selection)
-                for t in tickers:
-                    ex = exchange_snapshot.get(t)
-                    if ex:
-                        exchange_map[t] = ex
-                    else:
-                        core.log.warning(
-                            f"Exchange unknown for {t}. Its output Symbol will be unprefixed, "
-                            f"and if it's actually an NSE/BSE ticker the download will FAIL "
-                            f"outright (Yahoo needs the .NS/.BO suffix to find it at all). "
-                            f"Search for it via 'Refresh ticker list' first so its exchange is known."
-                        )
-
-            # Always one folder per exchange: output_dir/<EXCHANGE>/{raw,daily,
-            # by_symbol,combined,bhavcopy}. Unknown-exchange tickers go to UNKNOWN/.
-            if groups is None:
-                groups = {}
-                for t in tickers:
-                    groups.setdefault(exchange_map.get(t) or "UNKNOWN", []).append(t)
-            for ex in list(groups):
-                if sources.get(ex, "yahoo") != "yahoo":
-                    special[ex] = groups.pop(ex)
-            if not tickers and not special:
-                raise RuntimeError("No tickers resolved for the selected market(s)/ticker(s).")
-
-            n_special = 0
-            for ex, wanted in special.items():
-                if self.cancel_event.is_set():
-                    break
-                n_special += self._run_source(ex, wanted, sources[ex], start_s, end_s, output_dir, layout,
-                                              metastock_ascii)
-
-            for ex, ex_tickers in groups.items():
-                if self.cancel_event.is_set():
-                    break
-                core.log.info(f"=== {ex}: {len(ex_tickers)} ticker(s) ===")
-                ex_dir = output_dir / ex
-                ex_exchange_map = {t: (None if ex == "UNKNOWN" else ex) for t in ex_tickers}
-                core.download_all(ex_tickers, start_s, end_s, ex_dir / "raw", pause=0.3,
-                                   progress_callback=self._on_progress,
-                                   exchange_map=ex_exchange_map, max_workers=10,
-                                   cancel_event=self.cancel_event,
-                                   bse_source=bse_source, bse_adjust_splits=bse_adjust)
-                if self.cancel_event.is_set():
-                    break
-                core.report_data_quality(ex_dir / "raw", ex_tickers, ex_exchange_map)
-                self._build_outputs(ex_dir, ex_tickers, ex_exchange_map, layout, metastock_ascii,
-                                     start_s, end_s, output_dir)
-
-            if self.cancel_event.is_set():
-                self.after(0, self._download_finished, "cancelled",
-                           f"Cancelled. Whatever finished downloading is cached under:\n{output_dir}\n"
-                           f"Re-run the same settings later to resume and build outputs.")
-            else:
-                n_yahoo = sum(len(g) for g in groups.values())
-                self.after(0, self._download_finished, "success",
-                           f"Done -- {n_yahoo + n_special:,} ticker(s) processed.\nSaved under:\n{output_dir}")
-        except Exception as e:
-            core.log.error(f"GUI run failed: {e}")
-            self.after(0, self._download_finished, "error", str(e))
+        self.runner.write_bhavcopy = self.write_bhavcopy
+        self.runner.run_daily(markets, ticker_selection, exchange_snapshot, start_s, end_s, output_dir, layout,
+                              metastock_ascii, bse_source=bse_source, bse_adjust=bse_adjust, sources=sources)
 
     def _run_hourly_worker(self, markets, ticker_selection, exchange_snapshot,
                            start_s, end_s, output_dir, metastock_ascii):
-        try:
-            core.start_file_logging(output_dir)
-            pairs = []
-            if ticker_selection == "ALL":
-                for m in markets:
-                    if m not in hourly.HOURLY_EXCHANGES:
-                        core.log.warning(f"Hourly data isn't supported for {m}; skipping it.")
-                        continue
-                    df = core.fetch_ticker_directory([m], include_etfs=True,
-                                                     cache_path=CACHE_DIR / f"{m.lower()}_tickers.csv",
-                                                     refresh=False)
-                    df = df[df["Exchange"] == m]
-                    pairs += [(str(s), m) for s in df["Symbol"].dropna()]
-            else:
-                for t in ticker_selection:
-                    ex = exchange_snapshot.get(t)
-                    if ex in hourly.HOURLY_EXCHANGES:
-                        pairs.append((t, ex))
-                    else:
-                        core.log.warning(f"Skipping {t}: hourly data needs a known NSE/NASDAQ/NYSE "
-                                         f"ticker (exchange: {ex or 'unknown'}).")
-            if not pairs:
-                raise RuntimeError("No NSE/NASDAQ/NYSE tickers to download hourly data for.")
-
-            hourly_dir = output_dir
-            hourly.download_all_hourly(pairs, hourly_dir, workers=8,
-                                       progress_callback=self._on_progress,
-                                       cancel_event=self.cancel_event)
-            if not self.cancel_event.is_set():
-                hourly.build_hour_files(pairs, hourly_dir, metastock_ascii, start_s, end_s)
-
-            if self.cancel_event.is_set():
-                self.after(0, self._download_finished, "cancelled",
-                           f"Cancelled. Finished tickers are cached under:\n{hourly_dir}\n"
-                           f"Re-run the same settings later to resume.")
-            else:
-                self.after(0, self._download_finished, "success",
-                           f"Done -- hourly data for {len(pairs):,} ticker(s).\nSaved under:\n"
-                           f"{hourly_dir}")
-        except Exception as e:
-            core.log.error(f"GUI hourly run failed: {e}")
-            self.after(0, self._download_finished, "error", str(e))
-
-    def _run_source(self, ex, wanted, src, start_s, end_s, output_dir, layout, metastock_ascii) -> int:
-        """Alpaca (NASDAQ/NYSE) or NSE bhavcopy: update the exchange's source folder (all of it, or only
-        `wanted` for Alpaca), then build the outputs from it into the *_alpaca / *_official folders.
-        Returns how many tickers were built."""
-        ex_dir = output_dir / ex
-        what = "every symbol" if wanted is None else f"{len(wanted)} selected ticker(s)"
-        core.log.info(f"=== {ex}: {src} source, {what} ===")
-        self.after(0, self.status_var.set, f"{ex}: updating the {src} data...")
-        try:
-            core.update_source(ex, ex_dir, src, start_s, end_s, download=True, wanted=wanted,
-                               progress_callback=self._on_progress, cancel_event=self.cancel_event)
-        except Exception as e:
-            core.log.error(f"{ex}: updating the {src} data failed ({e}); building from the files already there")
-        if self.cancel_event.is_set():
-            return 0
-        src_dir, tickers = core.source_tickers(ex, ex_dir, src, wanted)
-        if not tickers:
-            core.log.error(f"{ex}: nothing to build from {src_dir}.")
-            return 0
-        self.after(0, self.status_var.set, f"{ex}: building {len(tickers):,} ticker(s)...")
-        self._build_outputs(ex_dir, tickers, {t: ex for t in tickers}, layout, metastock_ascii, start_s, end_s,
-                            output_dir, src_dir=src_dir, suffix=core.SOURCE_FOLDERS[src][1])
-        return len(tickers)
-
-    def _build_outputs(self, base_dir, tickers, exchange_map, layout, metastock_ascii, start_s, end_s,
-                       output_root, src_dir=None, suffix=""):
-        """Runs once, after all downloads for `tickers` have finished -- never
-        incrementally per-ticker, so combining a big batch only happens once.
-        src_dir/suffix: build from an Alpaca / NSE-official folder into daily<suffix>/ etc."""
-        raw_dir = src_dir or base_dir / "raw"
-        if layout in ("daily", "all"):
-            core.build_daily_csvs(raw_dir, base_dir / f"daily{suffix}", start_s, end_s,
-                                   tickers=tickers, exchange_map=exchange_map,
-                                   metastock_ascii=metastock_ascii)
-        if layout in ("per-symbol", "all"):
-            core.build_per_symbol_csvs(raw_dir, base_dir / f"by_symbol{suffix}", start_s, end_s,
-                                        tickers=tickers, exchange_map=exchange_map,
-                                        metastock_ascii=metastock_ascii)
-        if layout in ("combined", "all"):
-            core.build_combined_csv(raw_dir, base_dir / f"combined{suffix}" / "all_data.csv", start_s, end_s,
-                                     tickers=tickers, exchange_map=exchange_map,
-                                     metastock_ascii=metastock_ascii)
-        if self.write_bhavcopy:
-            core.build_bhavcopy_files(raw_dir, output_root, start_s, end_s,
-                                      tickers=tickers, exchange_map=exchange_map, folder=f"bhavcopy{suffix}")
+        self.runner.run_hourly(markets, ticker_selection, exchange_snapshot, start_s, end_s, output_dir,
+                               metastock_ascii)
 
     def _on_progress(self, done, total, failed, no_data):
         self.after(0, self._update_progress_ui, done, total, failed, no_data)
@@ -1218,8 +940,7 @@ class MarketDataGUI(tk.Tk):
     def _update_progress_ui(self, done, total, failed, no_data):
         self.progress["maximum"] = max(total, 1)
         self.progress["value"] = done
-        pct = 100 * done / total if total else 100
-        self.status_var.set(f"{pct:.1f}% | {done}/{total} | failed={failed} | no_data={no_data}")
+        self.status_var.set(appcore.progress_text(done, total, failed, no_data))
 
     def _download_finished(self, status: str, message: str):
         self._set_running_state(False)

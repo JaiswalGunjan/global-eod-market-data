@@ -53,12 +53,12 @@ def main():
 
     if not args.hourly_only:
         log.info("=== daily ===")
-        # this pipeline is built on the Yahoo raw/ caches (the default US source is Alpaca now)
-        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, "--layout", "daily",
+        # this pipeline is built on the Yahoo yahoo_adjusted/ caches (the default US source is Alpaca now)
+        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, 
             "--us-source", "yahoo", *skip, *ms)
         run("us_factors.py", "--root", args.daily_root, "--exchanges", *ex)
-        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, "--layout", "daily",
-            "--skip-download", "--price-basis", "raw", *dl, *ms)
+        run("eod_downloader.py", "--exchanges", *ex, "--output", args.daily_root, 
+            "--skip-download", "--us-source", "yahoo", "--price-basis", "raw", *dl, *ms)
     if not args.daily_only:
         log.info("=== hourly ===")
         run("hourly_downloader.py", "--exchanges", *ex, "--output", args.hourly_root, *skip, *ms)

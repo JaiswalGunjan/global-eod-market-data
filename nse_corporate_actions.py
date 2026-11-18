@@ -59,7 +59,7 @@ def main():
     nse = Path(args.root) / "NSE"
     dl, recon = nse / "raw_delisted", nse / "recon"
     log.info("Loading official closes ...")
-    closes = load_official_closes(nse / "official_cache" / "full")
+    closes = load_official_closes(nse / "official_raw" / "full")
     all_dates = np.array(sorted({d for s in closes.values() for d in s.index}))
     events = []
 

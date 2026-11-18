@@ -3,11 +3,11 @@
 Build the portable Windows bundle: dist/EOD_Market_Data/ and dist/EOD_Market_Data_<YYYYMMDD>.zip.
 
     venv\\Scripts\\python.exe -m pip install -r requirements-build.txt
-    venv\\Scripts\\python.exe build_bundle.py            # add --no-keys to leave the Alpaca key files out
+    venv\\Scripts\\python.exe build_bundle.py
 
 The folder holds EOD_Market_Data.exe (browser app), cli_daily.exe and cli_hourly.exe sharing one
 _internal/ (Python and every library), plus eod_config.ini, the NSE hand-maintained CSVs, README.md,
-QUICKSTART.txt, the Alpaca key files (.alpaca3.env, .alpaca2.env) and NSE's corporate-actions lists
+QUICKSTART.txt and NSE's corporate-actions lists
 (seed_data/NSE/nse_ca, ~10 MB, copied from <daily_output>/NSE/nse_ca; the app takes them into its own cache on
 the first NSE run, so it never downloads 2016..today from nseindia.com). No price data is copied; the build fails
 if any ends up in the folder. The recipient points eod_config.ini at their data folders.
@@ -26,8 +26,8 @@ DIST = HERE / "dist"
 APP = DIST / "EOD_Market_Data"
 EXTRA_FILES = ["nse_demergers.csv", "nse_mergers.csv", "nse_renames.csv", "nse_exit_info.csv",
                "README.md", "QUICKSTART.txt"]
-KEY_FILES = [".alpaca3.env", ".alpaca2.env"]          # .alpaca.env is dead (see CLAUDE.md)
-FORBIDDEN = ("market_data_", ".ticker_cache", "raw_1h", "official_cache", "bhavcopy_cache")
+KEY_FILES = []                                   # the Alpaca store is read, not downloaded: no keys needed
+FORBIDDEN = ("market_data_", ".ticker_cache", "raw_1h", "official_raw", "bhavcopy_cache")
 
 
 def build(with_keys: bool = True) -> Path:

@@ -3,13 +3,16 @@ bhavcopy, the default). The rules are ported from TranscriptExtract's swingbt/ns
 from this repo.
 
 update() runs three steps:
-  1. download  new day files into <root>/NSE/official_cache/full/YYYYMMDD.csv (as traded; the cache nse_delisted.py
+  1. download  new day files into <root>/NSE/official_raw/full/YYYYMMDD.csv (as traded; the cache nse_delisted.py
                fills too). Weekend special sessions (Muhurat, Budget day) are tried for the last WEEKEND_LOOKBACK days.
   2. actions   NSE's corporate-actions lists (main board and SME; the API behind nseindia.com's Corporate Actions page)
-               by calendar quarter into <root>/NSE/nse_ca/*.json -> nse_ca/nse_corporate_actions.csv. Closed quarters
-               are fetched once; a quarter is fetched again until a week after it ends.
-  3. build     every symbol, delisted and merged ones included -> <root>/NSE/official/NSE.<SYM>.csv
-               (Date,Open,High,Low,Close,Volume,Ticker, the raw/ layout), adjusted to today's share basis. Renames are
+               by calendar quarter into <root>/NSE/nse_ca/*.json -> nse_ca/nse_corporate_actions.csv. Downloaded
+               once and reused: nse_ca/checked.json remembers up to which ex-date each quarter was asked for, and
+               nseindia.com is only asked again when the day files reach a newer trading day -- then just the
+               new days (plus CA_OVERLAP_DAYS for late corrections) are fetched and merged into the cache. No new
+               day file = no request. --refresh-actions fetches every quarter again.
+  3. build     every symbol, delisted and merged ones included -> <root>/NSE/official_adjusted/NSE.<SYM>.csv
+               (Date,Open,High,Low,Close,Volume,Ticker, the yahoo_adjusted/ layout), adjusted to today's share basis. Renames are
                joined under the latest symbol (TATAMOTORS -> TMPV). Logs in <root>/NSE/official_info/. The build is
                skipped when no input changed since the last one.
 
@@ -29,14 +32,14 @@ A split, bonus or consolidation (several on one ex-date combined into one f) is 
 sessions) whose close-to-close move is closest to f, and only if that move is nearer f than 1; a ratio with
 f >= SMALL_F is applied on the ex-date even without a visible step. Split/bonus steps derived from Yahoo
 (corporate_actions.csv, nse_corporate_actions.py) that NSE's list lacks are applied under the same test, and so are
-moves beyond x1.6 that Yahoo's raw/ series shows as the same step, or that fall on an ISIN change and match a simple
+moves beyond x1.6 that Yahoo's yahoo_adjusted/ series shows as the same step, or that fall on an ISIN change and match a simple
 ratio. Anything else beyond x1.6 is only reported (official_info/gaps.csv).
 
 Mergers: the acquired company's series ends on its last trading day (it is kept, not spliced into the acquirer);
 official_info/meta.csv gives the price a holder got after it (NSE delisting exit price, merger ratio x the acquirer's
 next close, else the last close).
 
-    python nse_bhavcopy.py                    # download new days + corporate actions, rebuild official/
+    python nse_bhavcopy.py                    # download new days + corporate actions, rebuild official_adjusted/
     python nse_bhavcopy.py --skip-download    # rebuild from the caches only
 """
 import argparse
@@ -45,6 +48,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -53,11 +57,12 @@ import numpy as np
 import pandas as pd
 import requests
 
+import app_paths
 from nse_delisted import fetch_day
 from reconcile_nse import EQ_SERIES
 
 log = logging.getLogger("market_dl")
-HERE = Path(__file__).resolve().parent
+HERE = app_paths.APP_DIR       # nse_demergers.csv sits next to the scripts, or next to the exe in the bundle
 
 BUILD_VERSION = 1      # bump when the build rules change, so the next run rebuilds even if no input changed
 COLS = ["Open", "High", "Low", "Close", "Volume"]
@@ -84,11 +89,15 @@ CA_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, li
 CA_API = "https://www.nseindia.com/api/corporates-corporateActions?index={index}&from_date={a}&to_date={b}"
 CA_BOARDS = {"equities": "", "sme": "sme_"}     # index -> cache file prefix
 CA_CSV = "nse_corporate_actions.csv"
+CA_CHECKED = "checked.json"     # {quarter file: last ex-date the API was asked for}
+CA_OVERLAP_DAYS = 7             # an incremental fetch starts this many days before the last checked day
+SEED_CA_DIR = app_paths.APP_DIR / "seed_data" / "NSE" / "nse_ca"   # lists shipped with the portable bundle
+RX_CA_FILE = re.compile(r"^(?:sme_)?(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json$")
 
 
 def paths(nse_dir: Path) -> dict:
     nse_dir = Path(nse_dir)
-    return dict(cache=nse_dir / "official_cache" / "full", ca=nse_dir / "nse_ca", out=nse_dir / "official",
+    return dict(cache=nse_dir / "official_raw" / "full", ca=nse_dir / "nse_ca", out=nse_dir / "official_adjusted",
                 info=nse_dir / "official_info")
 
 
@@ -164,27 +173,130 @@ def _ca_fetch(s, a, b, index, tries=4):
     raise RuntimeError(f"NSE corporate actions {index} {a}..{b}: no data after {tries} tries")
 
 
-def update_corporate_actions(ca_dir: Path, start: dt.date = FIRST_DAY, download: bool = True) -> Path:
-    """Refresh the per-quarter JSON caches (unless download=False) and rewrite nse_corporate_actions.csv."""
+def _ca_checked(ca_dir: Path) -> dict:
+    """{quarter file name: date} -- the last ex-date each cached quarter list was fetched through. Caches written
+    before checked.json existed: a list covers its quarter up to the day the file was written (the fetch asked for
+    min(quarter end, that day))."""
+    try:
+        got = json.loads((ca_dir / CA_CHECKED).read_text(encoding="utf-8"))
+        return {k: dt.date.fromisoformat(v) for k, v in got.items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    out = {}
+    for f in ca_dir.glob("*.json"):
+        m = RX_CA_FILE.match(f.name)
+        if m:
+            written = dt.date.fromtimestamp(f.stat().st_mtime)
+            out[f.name] = min(dt.date.fromisoformat(m.group(2)), written)
+    return out
+
+
+def _save_ca_checked(ca_dir: Path, checked: dict):
+    (ca_dir / CA_CHECKED).write_text(json.dumps({k: v.isoformat() for k, v in sorted(checked.items())}, indent=1),
+                                     encoding="utf-8")
+
+
+def seed_corporate_actions(ca_dir: Path, seed_dir: Path = None) -> int:
+    """Take the corporate-actions lists shipped with the app (seed_data/NSE/nse_ca next to the exe, written by
+    build_bundle.py) into the cache: every quarter file the cache lacks, or holds checked through an earlier day.
+    Newer local files are kept. Returns how many lists were copied (0 when there is no seed)."""
+    seed_dir = Path(seed_dir or SEED_CA_DIR)
+    if not seed_dir.is_dir():
+        return 0
+    seed = _ca_checked(seed_dir)
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    local = _ca_checked(ca_dir)
+    copied = []
+    for name, day in seed.items():
+        if (seed_dir / name).exists() and (not (ca_dir / name).exists() or local.get(name, dt.date.min) < day):
+            shutil.copy2(seed_dir / name, ca_dir / name)
+            local[name] = day
+            copied.append(day)
+    if copied:
+        _save_ca_checked(ca_dir, local)
+        log.info(f"NSE corporate actions: {len(copied)} list(s) taken from the bundled data "
+                 f"(checked through {max(copied)}); only later trading days are asked from nseindia.com")
+    return len(copied)
+
+
+def _ex_date(row):
+    try:
+        return dt.datetime.strptime(str(row.get("exDate", "")), "%d-%b-%Y").date()
+    except ValueError:
+        return None
+
+
+def _merge_ca(old: list, new: list, a: dt.date, b: dt.date) -> list:
+    """The cached rows with an ex-date outside [a, b], plus the fresh rows (which replace those inside it)."""
+    keep = [r for r in old if not (_ex_date(r) is not None and a <= _ex_date(r) <= b)]
+    seen, out = set(), []
+    for r in keep + list(new):
+        key = json.dumps(r, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def latest_trading_day(cache: Path):
+    """The newest day file with trades in the bhavcopy cache (holiday markers are tiny), or None."""
+    days = [f.stem for f in Path(cache).glob("[0-9]*.csv") if f.stat().st_size > 60] if Path(cache).exists() else []
+    return dt.datetime.strptime(max(days), "%Y%m%d").date() if days else None
+
+
+def update_corporate_actions(ca_dir: Path, start: dt.date = FIRST_DAY, download: bool = True,
+                             through: dt.date = None, refresh: bool = False) -> Path:
+    """Bring the per-quarter JSON caches up to `through` (the newest trading day the prices reach; default today)
+    and rewrite nse_corporate_actions.csv. The lists are downloaded once and reused: only ex-dates after the last
+    checked day (minus CA_OVERLAP_DAYS) are asked for, so with no new trading day nothing is fetched. A failed
+    fetch leaves the checked day where it was, so the next run tries again. refresh=True fetches every quarter
+    again; download=False only rewrites the CSV from the cache."""
     ca_dir.mkdir(parents=True, exist_ok=True)
     today = dt.date.today()
-    if download:
-        todo = [(index, pre, q0, q1) for index, pre in CA_BOARDS.items() for q0, q1 in _quarters(start, today)
-                if not ((ca_dir / f"{pre}{q0}_{q1}.json").exists() and q1 < today - dt.timedelta(days=7))]
-        if todo:
-            log.info(f"NSE corporate actions: fetching {len(todo)} quarter list(s) from nseindia.com")
-            try:
-                s = _ca_session()
-                for index, pre, q0, q1 in todo:
-                    rows, s = _ca_fetch(s, q0, min(q1, today), index)
-                    (ca_dir / f"{pre}{q0}_{q1}.json").write_text(json.dumps(rows), encoding="utf-8")
-                    log.info(f"  {index} {q0}..{q1}: {len(rows)} events")
-                    time.sleep(3)
-            except (RuntimeError, requests.RequestException) as e:
-                log.warning(f"NSE corporate actions download failed ({e}); using the cached lists -- events since "
-                            f"the last successful fetch are missing until a later run gets through")
+    through = min(through or today, today)
+    if not refresh:
+        seed_corporate_actions(ca_dir)
+    checked = {} if refresh else _ca_checked(ca_dir)
+    todo = []
+    for index, pre in CA_BOARDS.items():
+        for q0, q1 in _quarters(start, through):
+            name = f"{pre}{q0}_{q1}.json"
+            want = min(q1, through)
+            done = checked.get(name) if (ca_dir / name).exists() else None
+            if done is not None and done >= want:
+                continue
+            a = q0 if done is None else max(q0, done - dt.timedelta(days=CA_OVERLAP_DAYS))
+            todo.append((index, name, q0, a, want))
+    if download and todo:
+        n_full = sum(a == q0 for _i, _n, q0, a, _w in todo)
+        log.info(f"NSE corporate actions: checking nseindia.com for {len(todo)} list(s) up to {through}"
+                 + (f" ({n_full} full quarter(s))" if n_full else " (new days only)"))
+        changed = 0
+        try:
+            s = _ca_session()
+            for index, name, q0, a, b in todo:
+                rows, s = _ca_fetch(s, a, b, index)
+                f = ca_dir / name
+                old = json.loads(f.read_text(encoding="utf-8")) if f.exists() and a > q0 else []
+                merged = rows if a == q0 else _merge_ca(old, rows, a, b)
+                before = {json.dumps(r, sort_keys=True) for r in old}
+                changed += len({json.dumps(r, sort_keys=True) for r in merged} - before)
+                f.write_text(json.dumps(merged), encoding="utf-8")
+                checked[name] = b
+                _save_ca_checked(ca_dir, checked)          # after every list, so a later failure keeps this one
+                log.info(f"  {index} {a}..{b}: {len(rows)} event(s)")
+                time.sleep(3)
+            log.info(f"NSE corporate actions: {changed} new or changed event(s)" if changed
+                     else "NSE corporate actions: no new events")
+        except (RuntimeError, requests.RequestException) as e:
+            log.warning(f"NSE corporate actions download failed ({e}); using the cached lists -- the next run with "
+                        f"downloading switched on tries again")
+    elif download:
+        log.info(f"NSE corporate actions: cached lists already checked through {through} (no new trading day)")
+    if not (ca_dir / CA_CHECKED).exists() and checked:
+        _save_ca_checked(ca_dir, checked)                   # record the dates taken from older caches
     rows = []
-    for f in sorted(ca_dir.glob("*_*.json")):
+    for f in sorted(f for f in ca_dir.glob("*.json") if RX_CA_FILE.match(f.name)):
         board = "sme" if f.name.startswith("sme_") else "equities"
         rows += [dict(r, board=board) for r in json.loads(f.read_text(encoding="utf-8"))]
     out = ca_dir / CA_CSV
@@ -339,7 +451,7 @@ def best_gap(df, d, f, before=2, after=3):
 
 
 def _yahoo_close(nse_dir: Path, sym: str):
-    p = nse_dir / "raw" / f"NSE.{sym}.csv"
+    p = nse_dir / "yahoo_adjusted" / f"NSE.{sym}.csv"
     if not p.exists() or p.stat().st_size < 30:
         return None
     try:
@@ -542,8 +654,8 @@ def _signature(nse_dir: Path, demergers_csv: Path) -> dict:
 
 def build(nse_dir: Path, demergers_csv: Path = HERE / "nse_demergers.csv", force: bool = False,
           progress_callback=None, cancel_event=None) -> bool:
-    """Rebuild <nse_dir>/official/ from the caches. Returns False when skipped (nothing changed since the last build)
-    or cancelled (cancel_event set before the files were written: official/ is left as it was).
+    """Rebuild <nse_dir>/official_adjusted/ from the caches. Returns False when skipped (nothing changed since the last build)
+    or cancelled (cancel_event set before the files were written: official_adjusted/ is left as it was).
     progress_callback(done, total, 0, 0) per symbol."""
     nse_dir = Path(nse_dir)
     p = paths(nse_dir)
@@ -601,12 +713,19 @@ def build(nse_dir: Path, demergers_csv: Path = HERE / "nse_demergers.csv", force
     n_syms = a["Final"].nunique()
     for n, (sym, g) in enumerate(a.groupby("Final", sort=True), 1):
         if cancel_event is not None and cancel_event.is_set():
-            log.warning("NSE official: rebuild cancelled -- official/ left as it was")
+            log.warning("NSE official: rebuild cancelled -- official_adjusted/ left as it was")
             return False
         if progress_callback and (n % 25 == 0 or n == n_syms):
             progress_callback(n, n_syms, 0, 0)
         df = clean(g.set_index("Date"))
         if len(df) < 2:
+            # one bar (a first run over a single day, the 1D quick range, or a one-day listing): nothing to adjust
+            if len(df) == 1:
+                asis_close[sym] = df["Close"].copy()
+                frames[sym] = df
+                meta.append(dict(Symbol=sym, First=df.index[0].date(), Last=df.index[-1].date(), Bars=1,
+                                 Active=df.index[-1] == last_day, LastClose=df["Close"].iat[-1], Events=0,
+                                 JoinedFrom=" ".join(s for s in joined if owner[s] == sym)))
             continue
         isin = g.set_index("Date")["ISIN"]
         asis_close[sym] = df["Close"].copy()
@@ -735,7 +854,7 @@ def build(nse_dir: Path, demergers_csv: Path = HERE / "nse_demergers.csv", force
         if n % 1000 == 0:
             log.info(f"  adjusted {n} symbols | {time.time() - t0:.0f}s")
 
-    # write the bars (raw/ layout) and drop files of symbols that no longer exist as a series (renamed since)
+    # write the bars (yahoo_adjusted/ layout) and drop files of symbols that no longer exist as a series (renamed since)
     p["out"].mkdir(parents=True, exist_ok=True)
     p["info"].mkdir(parents=True, exist_ok=True)
     written = set()
@@ -770,7 +889,7 @@ def _readme(meta, log_df, last_day):
     return (f"# NSE official daily bars (nse_bhavcopy.py)\n\n"
             f"Built {dt.datetime.now():%Y-%m-%d %H:%M} from NSE's bhavcopies up to {last_day.date()}, back-adjusted "
             f"with NSE's corporate-actions lists (see nse_bhavcopy.py's docstring for the rules).\n\n"
-            f"* `../official/NSE.<SYM>.csv`: {len(meta):,} symbols ({int(meta['Active'].sum()):,} trading on the last "
+            f"* `../official_adjusted/NSE.<SYM>.csv`: {len(meta):,} symbols ({int(meta['Active'].sum()):,} trading on the last "
             f"day; the rest are delisted or merged and end on their last trading day).\n"
             f"* `meta.csv`: first/last bar, rename chains joined in, exit price after the last bar.\n"
             f"* `events.csv`: every corporate action considered and what was done ({st}).\n"
@@ -780,9 +899,10 @@ def _readme(meta, log_df, last_day):
 
 # ------------------------------------------------------------------ entry point -------------------------------------
 def update(nse_dir: Path, start: str = None, end: str = None, download: bool = True, workers: int = 6,
-           force_build: bool = False, progress_callback=None, cancel_event=None) -> bool:
-    """Download new day files and corporate actions (unless download=False), then rebuild official/ if anything
-    changed. Day files are fetched from max(start, FIRST_DAY) .. end (inclusive), or from the newest cached day."""
+           force_build: bool = False, progress_callback=None, cancel_event=None, refresh_actions: bool = False) -> bool:
+    """Download new day files (unless download=False), check NSE's corporate actions for the trading days that
+    arrived since the last check (none new = no request), then rebuild official_adjusted/ if anything changed. Day files
+    are fetched from max(start, FIRST_DAY) .. end (inclusive), or from the newest cached day."""
     nse_dir = Path(nse_dir)
     p = paths(nse_dir)
     if download:
@@ -794,21 +914,25 @@ def update(nse_dir: Path, start: str = None, end: str = None, download: bool = T
             log.info("NSE bhavcopy: first run -- the whole range was fetched")
     if cancel_event is not None and cancel_event.is_set():
         return False
-    update_corporate_actions(p["ca"], download=download)
+    update_corporate_actions(p["ca"], download=download, through=latest_trading_day(p["cache"]),
+                             refresh=refresh_actions)
     return build(nse_dir, force=force_build, progress_callback=progress_callback, cancel_event=cancel_event)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="market_data_daily")
+    ap.add_argument("--root", default=str(app_paths.daily_output()))
     ap.add_argument("--start", default=None, help="first day to make sure is cached (default: oldest, 2016-10-06)")
     ap.add_argument("--skip-download", action="store_true", help="no network: rebuild from the caches")
     ap.add_argument("--force", action="store_true", help="rebuild even if no input changed")
+    ap.add_argument("--refresh-actions", action="store_true",
+                    help="download NSE's corporate-actions lists for every quarter again (normally only the trading "
+                         "days since the last check are asked for)")
     ap.add_argument("--workers", type=int, default=6)
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     update(Path(args.root) / "NSE", start=args.start, download=not args.skip_download, workers=args.workers,
-           force_build=args.force)
+           force_build=args.force, refresh_actions=args.refresh_actions)
 
 
 if __name__ == "__main__":

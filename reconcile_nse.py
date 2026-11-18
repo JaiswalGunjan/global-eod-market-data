@@ -1,15 +1,15 @@
-"""Reconcile Yahoo (split-adjusted) NSE closes in raw/ against NSE's official as-traded bhavcopy.
+"""Reconcile Yahoo (split-adjusted) NSE closes in yahoo_adjusted/ against NSE's official as-traded bhavcopy.
 
 For each sampled date, factor = official_close / yahoo_close. Yahoo is adjusted for later splits/bonuses, so
 factor is the cumulative scale needed to get back to the price that actually traded (1.0 = no later split).
-Also lists symbols that traded officially on a sampled date but have no raw/ file (delisted, renamed, never fetched).
+Also lists symbols that traded officially on a sampled date but have no yahoo_adjusted/ file (delisted, renamed, never fetched).
 
 Outputs (under <root>/NSE/recon/):
   implied_factors.csv   Symbol,Date,Official,Yahoo,Factor
   factor_steps.csv      per ticker: the distinct factor levels and the date range of each
   suspicious.csv        tickers whose factor is not a clean split ratio, or changes without a clean step
   missing_from_raw.csv  Date,Symbol,ISIN,Close for official EQ-type symbols with no raw file
-Official zips are cached in <root>/NSE/official_cache/.
+Official zips are cached in <root>/NSE/official_raw/.
 """
 import argparse
 import datetime as dt
@@ -100,12 +100,12 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     nse = Path(args.root) / "NSE"
-    raw_dir, out = nse / "raw", nse / "recon"
-    cache = nse / "official_cache"
+    raw_dir, out = nse / "yahoo_adjusted", nse / "recon"
+    cache = nse / "official_raw"
     out.mkdir(exist_ok=True)
     cache.mkdir(exist_ok=True)
 
-    log.info("Loading raw/ ...")
+    log.info("Loading yahoo_adjusted/ ...")
     yahoo = {}
     for p in raw_dir.glob("NSE.*.csv"):
         if p.stat().st_size < 30:

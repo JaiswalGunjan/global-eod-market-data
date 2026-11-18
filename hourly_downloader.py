@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import app_paths
 import eod_downloader as core
 
 log = core.log
@@ -53,7 +54,7 @@ YAHOO_1H_MAX_DAYS = 729  # Yahoo rejects 1h requests reaching back more than 730
 RAW_COLUMNS = ["Datetime", "Open", "High", "Low", "Close", "Volume", "Ticker"]
 METASTOCK_HOURLY_HEADER = ["<TICKER>", "<PER>", "<DTYYYYMMDD>", "<TIME>",
                            "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<VOL>"]
-TICKER_CACHE_DIR = Path(__file__).resolve().parent / ".ticker_cache"
+TICKER_CACHE_DIR = app_paths.ticker_cache_dir()
 
 
 def _yf_fetch_hourly(yf_symbol: str, start: str):
@@ -313,7 +314,7 @@ def resolve_tickers(args):
         if args.ticker_file:
             df = core.load_tickers_from_file(args.ticker_file, ex)
         else:
-            TICKER_CACHE_DIR.mkdir(exist_ok=True)
+            TICKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             df = core.fetch_ticker_directory([ex], include_etfs=not args.no_etfs,
                                              cache_path=TICKER_CACHE_DIR / f"{ex.lower()}_tickers.csv",
                                              refresh=args.refresh_tickers)
@@ -333,7 +334,7 @@ def parse_args():
     p.add_argument("--ticker", help="Download a single ticker, e.g. RELIANCE or AAPL")
     p.add_argument("--ticker-exchange", choices=HOURLY_EXCHANGES)
     p.add_argument("--ticker-file", help="CSV with a Symbol column (applied to each --exchanges entry)")
-    p.add_argument("--output", default="./market_data_hourly")
+    p.add_argument("--output", default=str(app_paths.hourly_output()))
     p.add_argument("--limit", type=int, help="Only the first N tickers per exchange (testing)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--progress-every", type=float, default=60, help="Seconds between progress lines")

@@ -7,3 +7,8 @@ market_data_daily/
 market_data_hourly/
 .ticker_cache/
 market_data_alpaca/
+build/
+dist/
+seed_data/
+
+market_data_daily_backup/

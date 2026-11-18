@@ -20,7 +20,7 @@ RATIO_RANGE = (0.6, 1.7)
 
 
 def load_official_closes(cache: Path):
-    """{symbol: Series(close, indexed by 'YYYY-MM-DD')} from official_cache/full/, EQ series preferred."""
+    """{symbol: Series(close, indexed by 'YYYY-MM-DD')} from official_raw/full/, EQ series preferred."""
     off = pd.concat([pd.read_csv(p, usecols=["Date", "Symbol", "Series", "Close"], dtype=str)
                      for p in sorted(cache.glob("*.csv")) if p.stat().st_size > 60], ignore_index=True)
     off["Close"] = pd.to_numeric(off.Close, errors="coerce")
@@ -39,7 +39,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     nse = Path(args.root) / "NSE"
-    cache, dl = nse / "official_cache" / "full", nse / "raw_delisted"
+    cache, dl = nse / "official_raw" / "full", nse / "raw_delisted"
     m = pd.read_csv(dl / "isin_map.csv", dtype=str).fillna("")
     chains = m[m.Successor != ""].copy()
     rp = Path(args.renames)

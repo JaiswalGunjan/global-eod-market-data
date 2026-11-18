@@ -24,7 +24,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import alpaca_us as au            # noqa: E402
+import alpaca_store               # noqa: E402
 import eod_downloader as core     # noqa: E402
 import nse_bhavcopy as nb         # noqa: E402
 
@@ -62,334 +62,6 @@ def series(dates, base):
     return base * (1 + 0.01 * np.sin(np.arange(len(dates))))
 
 
-class FakeApi:
-    """Stands in for alpaca_us.Alpaca: bars() serves `current` (today's symbol mapping) or `asof` frames."""
-
-    def __init__(self, current=None, asof=None, events=None, renames=None, assets=None):
-        self.current = current or {}
-        self.asof = asof or {}
-        self.events = {} if events is None else events
-        self.renames = renames or []
-        self.assets = assets
-        self.calls = 0
-        self.requests = []
-
-    def bars(self, symbols, start, end=None, asof=None):
-        self.calls += 1
-        self.requests.append((tuple(symbols), start, end, asof))
-        out = {}
-        for s in symbols:
-            df = self.asof.get((s, asof)) if asof else self.current.get(s)
-            df = au._frame([]) if df is None else df
-            m = df.index >= pd.Timestamp(start)
-            if end:
-                m &= df.index <= pd.Timestamp(end)
-            out[s] = df[m]
-        return out
-
-    def corporate_actions(self, start, end):
-        return self.events, self.renames
-
-    def active_assets(self):
-        if isinstance(self.assets, Exception):
-            raise self.assets
-        return self.assets
-
-
-class AlpacaUpdateTests(unittest.TestCase):
-    def setUp(self):
-        self._td = tmpdir()
-        self.root = Path(self._td.name)
-        self.a_dir = self.root / "NYSE" / "alpaca"
-        self.a_dir.mkdir(parents=True)
-
-    def tearDown(self):
-        self._td.cleanup()
-
-    def put(self, key, df, ticker=None):
-        p = self.a_dir / f"NYSE.{key}.csv"
-        au._write(p, df, ticker or key)          # the export writes the whole key
-        return p
-
-    def get(self, key):
-        return au._read(self.a_dir / f"NYSE.{key}.csv")
-
-    def exits(self, rows):
-        pd.DataFrame(rows, columns=["key", "still_trading"]).to_csv(self.a_dir.parent / "alpaca_exits.csv",
-                                                                    index=False)
-
-    def run_update(self, api, **kw):
-        return au.update_exchange("NYSE", self.a_dir, api, **kw)
-
-    # ---------------------------------------------------------------------------------------------- tail updates
-    def test_tail_extended_and_overlap_replaced(self):
-        c = series(ALL, 50)
-        self.put("AAA", frame(HIST, c[:len(HIST)]))
-        cur = frame(ALL, c)
-        cur.loc[pd.Timestamp("2026-10-23"), "Close"] = 77.0       # Alpaca corrected the last stored bar
-        r = self.run_update(FakeApi(current={"AAA": cur}))
-        got = self.get("AAA")
-        self.assertEqual(r["updated"], 1)
-        self.assertEqual(got.index[-1], pd.Timestamp("2026-11-06"))
-        self.assertEqual(got.at[pd.Timestamp("2026-10-23"), "Close"], 77.0)
-        self.assertTrue(np.allclose(got["Close"].iloc[:len(HIST) - 1], c[:len(HIST) - 1]))
-        self.assertEqual(len(got), len(ALL))
-
-    def test_idempotent_second_run_writes_nothing(self):
-        c = series(ALL, 50)
-        self.put("AAA", frame(HIST, c[:len(HIST)]))
-        api = FakeApi(current={"AAA": frame(ALL, c)})
-        self.run_update(api)
-        p = self.a_dir / "NYSE.AAA.csv"
-        before = (p.read_bytes(), p.stat().st_mtime_ns)
-        r = self.run_update(api)
-        self.assertEqual(r["updated"], 0)
-        self.assertEqual((p.read_bytes(), p.stat().st_mtime_ns), before)
-
-    def test_split_rescales_history_with_exact_listed_ratio(self):
-        raw = series(ALL, 400)
-        ex = pd.Timestamp("2026-10-28")
-        adj = np.where(ALL < ex, raw / 4, raw / 4)                  # post-split raw is already /4
-        stored = frame(HIST, raw[:len(HIST)], vol=1000)               # stored before the split: old basis
-        self.put("SPL", stored)
-        cur = frame(ALL, adj * (1 + 1e-5), vol=np.where(ALL < ex, 4000, 4000))   # Alpaca rounding noise
-        api = FakeApi(current={"SPL": cur}, events={"SPL": [("2026-10-28", "forward_splits", 0.25)]})
-        r = self.run_update(api)
-        got = self.get("SPL")
-        self.assertEqual(r["rescaled"], 1)
-        old_part = got[got.index < pd.Timestamp("2026-10-22")]
-        self.assertTrue(np.allclose(old_part["Close"], raw[:len(old_part)] * 0.25, rtol=1e-12))  # exact 0.25
-        self.assertTrue((old_part["Volume"] == 4000).all())
-        log_ = pd.read_csv(self.a_dir.parent / "alpaca_updates.csv")
-        self.assertIn("rescaled", set(log_["action"]))
-
-    def test_split_ratio_disagreeing_with_listing_is_skipped(self):
-        raw = series(ALL, 400)
-        self.put("SPL", frame(HIST, raw[:len(HIST)]))
-        api = FakeApi(current={"SPL": frame(ALL, raw / 2)}, events={"SPL": [("2026-10-28", "forward_splits", 0.25)]})
-        p = self.a_dir / "NYSE.SPL.csv"
-        before = p.read_bytes()
-        r = self.run_update(api)
-        self.assertEqual((r["skipped"], r["rescaled"]), (1, 0))
-        self.assertEqual(p.read_bytes(), before)
-
-    def test_unexplained_change_is_skipped_ticker_reuse(self):
-        """SUPN case: Alpaca's ticker now maps to another company; no split/spin-off listed -> file untouched."""
-        self.put("SUPN", frame(HIST, series(HIST, 42)))
-        other = frame(ALL, series(ALL, 35))
-        p = self.a_dir / "NYSE.SUPN.csv"
-        before = p.read_bytes()
-        r = self.run_update(FakeApi(current={"SUPN": other}, events={}))
-        self.assertEqual(r["skipped"], 1)
-        self.assertEqual(p.read_bytes(), before)
-        log_ = pd.read_csv(self.a_dir.parent / "alpaca_updates.csv")
-        self.assertEqual(log_["action"].tolist(), ["skipped"])
-
-    def test_corporate_actions_unavailable_means_no_rescale(self):
-        self.put("SPL", frame(HIST, series(HIST, 400)))
-        r = self.run_update(FakeApi(current={"SPL": frame(ALL, series(ALL, 100))}, events=None))
-        self.assertEqual((r["skipped"], r["rescaled"]), (1, 0))
-
-    def test_spin_off_rescales_by_measured_drop_volume_unchanged(self):
-        raw = series(ALL, 100)
-        self.put("PAR", frame(HIST, raw[:len(HIST)], vol=500))
-        cur = frame(ALL, np.where(ALL < pd.Timestamp("2026-10-27"), raw * 0.8, raw), vol=500)
-        r = self.run_update(FakeApi(current={"PAR": cur}, events={"PAR": [("2026-10-27", "spin_offs", None)]}))
-        got = self.get("PAR")
-        self.assertEqual(r["rescaled"], 1)
-        old_part = got[got.index < pd.Timestamp("2026-10-22")]
-        self.assertTrue(np.allclose(old_part["Close"], raw[:len(old_part)] * 0.8))
-        self.assertTrue((old_part["Volume"] == 500).all())
-
-    def test_missing_overlap_day_is_skipped_new_security(self):
-        """CDLR case: Alpaca's current history for the ticker starts after the stored overlap day."""
-        self.put("CDLR", frame(HIST, series(HIST, 25)))
-        later = pd.bdate_range("2026-11-05", "2026-11-06")
-        p = self.a_dir / "NYSE.CDLR.csv"
-        before = p.read_bytes()
-        r = self.run_update(FakeApi(current={"CDLR": frame(later, [7.4, 6.7])}))
-        self.assertEqual(r["skipped"], 1)
-        self.assertEqual(p.read_bytes(), before)
-
-    def test_delisted_and_at_keys_are_never_touched(self):
-        self.put("DEL", frame(HIST, series(HIST, 10)))
-        self.put("OLD@2020-01-01", frame(HIST, series(HIST, 10)))
-        self.put("LIVE", frame(HIST, series(HIST, 10)))
-        self.exits([("DEL", "False"), ("OLD@2020-01-01", "False"), ("LIVE", "True")])
-        bars = frame(ALL, series(ALL, 10))
-        snap = {k: (self.a_dir / f"NYSE.{k}.csv").read_bytes() for k in ("DEL", "OLD@2020-01-01")}
-        api = FakeApi(current={"DEL": bars, "OLD@2020-01-01": bars, "OLD": bars, "LIVE": bars})
-        r = self.run_update(api)
-        self.assertEqual(r["updated"], 1)
-        for k, b in snap.items():
-            self.assertEqual((self.a_dir / f"NYSE.{k}.csv").read_bytes(), b)
-        asked = {s for req in api.requests for s in req[0]}
-        self.assertNotIn("DEL", asked)
-
-    def test_unfinished_today_and_flat_no_trade_bars_dropped(self):
-        c = series(ALL, 50)
-        self.put("AAA", frame(HIST, c[:len(HIST)]))
-        today = pd.Timestamp.now(tz=au.NY).normalize().tz_localize(None)
-        flat = frame([pd.Timestamp("2026-11-09")], [60.0], vol=0)
-        flat["High"] = flat["Low"] = 60.0
-        cur = pd.concat([frame(ALL, c), flat, frame([today], [61.0])])
-        self.run_update(FakeApi(current={"AAA": cur}))
-        got = self.get("AAA")
-        self.assertNotIn(pd.Timestamp("2026-11-09"), got.index)
-        if pd.Timestamp.now(tz=au.NY).hour < 20:
-            self.assertNotIn(today, got.index)
-
-    # --------------------------------------------------------------------------------------------------- renames
-    def test_rename_with_same_ticker_never_deletes(self):
-        """Regression: Alpaca lists CUSIP/name-only changes as name changes with old == new."""
-        c = series(ALL, 20)
-        self.put("XRPN", frame(HIST, c[:len(HIST)]))
-        r = self.run_update(FakeApi(current={"XRPN": frame(ALL, c)}, renames=[("XRPN", "XRPN", "2026-10-12")]))
-        self.assertTrue((self.a_dir / "NYSE.XRPN.csv").exists())
-        self.assertEqual((r["renamed"], r["updated"]), (0, 1))
-
-    def test_rename_to_new_ticker(self):
-        c = series(ALL, 20)
-        self.put("ABC", frame(HIST, c[:len(HIST)]))
-        r = self.run_update(FakeApi(current={"XYZ": frame(ALL, c)}, renames=[("ABC", "XYZ", "2026-11-01")]))
-        self.assertFalse((self.a_dir / "NYSE.ABC.csv").exists())
-        got = self.get("XYZ")
-        self.assertEqual((got.index[0], got.index[-1]), (ALL[0], ALL[-1]))
-        self.assertEqual(got["Ticker"].iloc[0], "XYZ")
-        self.assertEqual(r["renamed"], 1)
-
-    def test_rename_where_new_file_is_same_company_drops_duplicate(self):
-        c = series(ALL, 20)
-        self.put("MSGS", frame(HIST, c[:len(HIST)]))
-        self.put("MSGK", frame(HIST, c[:len(HIST)]))
-        r = self.run_update(FakeApi(current={"MSGK": frame(ALL, c)}, renames=[("MSGS", "MSGK", "2026-10-27")]))
-        self.assertFalse((self.a_dir / "NYSE.MSGS.csv").exists())
-        self.assertEqual(self.get("MSGK").index[-1], ALL[-1])
-        self.assertEqual(r["renamed"], 0)
-
-    def test_ticker_reused_by_renamed_company_freezes_previous_owner(self):
-        """SUPN case done right: INDV renamed SUPN; the old SUPN company becomes SUPN@<date>."""
-        a_hist, b_hist = series(HIST, 42), series(HIST, 30)
-        self.put("SUPN", frame(HIST, a_hist))
-        self.put("INDV", frame(HIST, b_hist))
-        a_tail_dates = pd.bdate_range("2026-10-23", "2026-11-03")       # incl. the change day itself
-        a_tail = frame(a_tail_dates, np.r_[a_hist[-1], np.full(len(a_tail_dates) - 1, 41.0)])
-        api = FakeApi(current={"SUPN": frame(ALL, series(ALL, 30))},
-                      asof={("SUPN", "2026-11-02"): a_tail},
-                      renames=[("INDV", "SUPN", "2026-11-03")])
-        self.run_update(api)
-        self.assertFalse((self.a_dir / "NYSE.INDV.csv").exists())
-        frozen = self.get("SUPN@2026-11-03")
-        self.assertEqual(frozen.index[-1], pd.Timestamp("2026-11-02"))          # nothing from the change day on
-        self.assertTrue(np.allclose(frozen["Close"].iloc[:len(HIST)], a_hist))
-        self.assertEqual(set(frozen["Ticker"]), {"SUPN@2026-11-03"})          # a separate security in MetaStock
-        self.assertEqual(set(self.get("SUPN")["Ticker"]), {"SUPN"})
-        self.assertTrue(np.allclose(self.get("SUPN")["Close"], series(ALL, 30)))
-
-    # ------------------------------------------------------------------------------------------- new / keys mode
-    def test_new_listings_only_unknown_symbols_on_this_exchange(self):
-        self.put("AAA", frame(HIST, series(HIST, 5)))
-        uni = self.root / "universe.csv"
-        pd.DataFrame({"symbol": ["KNOWN"]}).to_csv(uni, index=False)
-        assets = pd.DataFrame({"symbol": ["NEWX", "KNOWN", "OTHER", "AAA"],
-                               "exchange": ["NYSE", "NYSE", "NASDAQ", "NYSE"]})
-        bars = frame(ALL, series(ALL, 5))
-        api = FakeApi(current={s: bars for s in ("AAA", "NEWX", "KNOWN", "OTHER")}, assets=assets)
-        r = self.run_update(api, universe_csv=uni)
-        self.assertEqual(r["added"], 1)
-        self.assertTrue((self.a_dir / "NYSE.NEWX.csv").exists())
-        self.assertFalse((self.a_dir / "NYSE.KNOWN.csv").exists())
-        self.assertFalse((self.a_dir / "NYSE.OTHER.csv").exists())
-
-    def test_keys_mode_touches_only_wanted_and_fetches_missing(self):
-        bars = frame(ALL, series(ALL, 5))
-        self.put("AAA", frame(HIST, series(HIST, 5)))
-        self.put("BBB", frame(HIST, series(HIST, 5)))
-        bbb = (self.a_dir / "NYSE.BBB.csv").read_bytes()
-        api = FakeApi(current={"AAA": bars, "BBB": bars, "ZZZ": bars}, assets=AssertionError("must not list"))
-        r = self.run_update(api, keys=["aaa", "zzz"])
-        self.assertEqual((r["updated"], r["added"]), (1, 1))
-        self.assertEqual((self.a_dir / "NYSE.BBB.csv").read_bytes(), bbb)
-        self.assertEqual(self.get("ZZZ").index[0], ALL[0])
-        self.assertNotIn("BBB", {s for req in api.requests for s in req[0]})
-
-    def test_cancel_before_start_changes_nothing(self):
-        self.put("AAA", frame(HIST, series(HIST, 5)))
-        before = (self.a_dir / "NYSE.AAA.csv").read_bytes()
-        ev = threading.Event()
-        ev.set()
-        calls = []
-        r = self.run_update(FakeApi(current={"AAA": frame(ALL, series(ALL, 5))}, assets=AssertionError("no")),
-                            cancel_event=ev, progress_callback=lambda *a: calls.append(a))
-        self.assertEqual(r["updated"], 0)
-        self.assertEqual((self.a_dir / "NYSE.AAA.csv").read_bytes(), before)
-
-    def test_progress_callback_called_per_batch(self):
-        for i in range(3):
-            self.put(f"K{i}", frame(HIST, series(HIST, 5)))
-        calls = []
-        self.run_update(FakeApi(current={f"K{i}": frame(ALL, series(ALL, 5)) for i in range(3)}),
-                        progress_callback=lambda *a: calls.append(a))
-        self.assertEqual(calls[-1][:2], (1, 1))
-
-
-class AlpacaClientTests(unittest.TestCase):
-    def test_bars_end_capped_before_next_day_and_recent_window(self):
-        api = au.Alpaca("k", "s", pause=0)
-        seen = []
-        api.get = lambda url, params=None, tries=5: (seen.append(dict(params)) or ({"bars": {}}, ""))
-        api.bars(["X"], "2026-10-01", "2026-11-05")
-        self.assertEqual(seen[-1]["end"], "2026-11-06T04:59:00Z")             # 00:00 EST next day - 1 minute
-        api.bars(["X"], "2026-10-01")
-        end = pd.Timestamp(seen[-1]["end"])
-        self.assertLessEqual(end, pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=15))
-        api.bars(["X"], "2026-10-01", "2026-11-05", asof="2026-11-04")
-        self.assertEqual(seen[-1]["asof"], "2026-11-04")
-
-    def test_invalid_symbol_dropped_and_retried(self):
-        api = au.Alpaca("k", "s", pause=0)
-        answers = [(None, 'HTTP 400: {"message":"invalid symbol: BAD-P"}'),
-                   ({"bars": {"GOOD": [{"t": "2026-11-05T05:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5,
-                                        "v": 10}]}}, "")]
-        asked = []
-        api.get = lambda url, params=None, tries=5: (asked.append(params["symbols"]) or answers.pop(0))
-        out = api.bars(["GOOD", "BAD-P"], "2026-11-01")
-        self.assertEqual(asked, ["GOOD,BAD-P", "GOOD"])
-        self.assertTrue(out["BAD-P"].empty)
-        self.assertEqual(out["GOOD"].index[0], pd.Timestamp("2026-11-05"))     # NY date of the bar
-
-    def test_corporate_actions_parsing(self):
-        api = au.Alpaca("k", "s", pause=0)
-        js = {"corporate_actions": {
-            "forward_splits": [{"symbol": "SOXX", "ex_date": "2026-11-05", "new_rate": 3, "old_rate": 1}],
-            "reverse_splits": [{"symbol": "XXII", "ex_date": "2026-11-05", "new_rate": 1, "old_rate": 58}],
-            "spin_offs": [{"source_symbol": "MSGS", "new_symbol": "MSGR", "ex_date": "2026-10-27"}],
-            "name_changes": [{"old_symbol": "MSGS", "new_symbol": "MSGK", "process_date": "2026-10-27"}]}}
-        api.get = lambda url, params=None, tries=5: (js, "")
-        ev, ren = api.corporate_actions("2026-10-01", "2026-11-10")
-        self.assertAlmostEqual(ev["SOXX"][0][2], 1 / 3)
-        self.assertAlmostEqual(ev["XXII"][0][2], 58)
-        self.assertEqual(ev["MSGK"][0][1], "spin_offs")                       # copied to the new name
-        self.assertEqual(ren, [("MSGS", "MSGK", "2026-10-27")])
-
-    def test_explain_rules(self):
-        ref = pd.Timestamp("2026-10-22")
-        ev = {"A": [("2026-10-28", "reverse_splits", 10.0)], "B": [("2026-10-27", "spin_offs", None)],
-              "C": [("2026-10-01", "forward_splits", 0.5)]}
-        self.assertEqual(au._explain(10.003, ev, "A", ref)[:2], (10.0, 0.1))
-        self.assertIsNone(au._explain(5.0, ev, "A", ref)[0])
-        self.assertAlmostEqual(au._explain(0.8, ev, "B", ref)[0], 0.8)
-        self.assertIsNone(au._explain(1.3, ev, "B", ref)[0])                   # a spin-off can't raise history
-        self.assertIsNone(au._explain(0.5, ev, "C", ref)[0])                   # event before the overlap day
-        self.assertIsNone(au._explain(0.5, {}, "Z", ref)[0])
-        self.assertIsNone(au._explain(0.5, None, "Z", ref)[0])
-
-    def test_symbol_of(self):
-        self.assertEqual(au.symbol_of("BRK.B"), "BRK.B")
-        self.assertEqual(au.symbol_of("CON_"), "CON")
-        self.assertEqual(au.symbol_of("ABC~W"), "ABC/W")
-
-
 # =========================================================================================================== NSE
 NSE_DATES = [d for d in pd.bdate_range("2026-01-01", "2026-03-31") if d != pd.Timestamp("2026-01-26")]
 
@@ -400,7 +72,7 @@ def osc(i):
 
 def make_nse(nse_dir: Path, demergers_csv: Path):
     """Synthetic NSE caches: day files, a corporate-actions quarter JSON and a demerger list."""
-    cache = nse_dir / "official_cache" / "full"
+    cache = nse_dir / "official_raw" / "full"
     cache.mkdir(parents=True)
     rows = []
 
@@ -446,7 +118,7 @@ def make_nse(nse_dir: Path, demergers_csv: Path):
 
 
 def read_official(nse_dir, sym):
-    return pd.read_csv(nse_dir / "official" / f"NSE.{sym}.csv", parse_dates=["Date"], index_col="Date")
+    return pd.read_csv(nse_dir / "official_adjusted" / f"NSE.{sym}.csv", parse_dates=["Date"], index_col="Date")
 
 
 class NseParseTests(unittest.TestCase):
@@ -520,7 +192,7 @@ class NseBuildTests(unittest.TestCase):
         self.assertFalse((e.kind.astype(str).str.contains("dividend")).any())
 
     def test_rename_joined_under_latest_symbol(self):
-        self.assertFalse((self.nse / "official" / "NSE.OLDN.csv").exists())
+        self.assertFalse((self.nse / "official_adjusted" / "NSE.OLDN.csv").exists())
         n = read_official(self.nse, "NEWN")
         self.assertEqual(n.index[0], NSE_DATES[0])
         self.assertEqual(len(n), len(NSE_DATES))
@@ -544,11 +216,11 @@ class NseBuildTests(unittest.TestCase):
         self.assertAlmostEqual(read_official(self.nse, "NOG")["Close"].iloc[0], 80 * osc(0), places=3)
 
     def test_fund_units_and_holiday_marker_skipped(self):
-        self.assertFalse((self.nse / "official" / "NSE.ETFX.csv").exists())
+        self.assertFalse((self.nse / "official_adjusted" / "NSE.ETFX.csv").exists())
         self.assertNotIn(pd.Timestamp("2026-01-26"), read_official(self.nse, "SPL").index)
 
     def test_layout_matches_raw_cache(self):
-        cols = pd.read_csv(self.nse / "official" / "NSE.SPL.csv", nrows=1).columns.tolist()
+        cols = pd.read_csv(self.nse / "official_adjusted" / "NSE.SPL.csv", nrows=1).columns.tolist()
         self.assertEqual(cols, ["Date", "Open", "High", "Low", "Close", "Volume", "Ticker"])
 
     def test_ca_csv_lf_only_and_stable(self):
@@ -580,7 +252,7 @@ class NseBuildControlTests(unittest.TestCase):
 
     def test_cancel_leaves_official_untouched(self):
         nb.build(self.nse, demergers_csv=self.dm)
-        f = self.nse / "official" / "NSE.SPL.csv"
+        f = self.nse / "official_adjusted" / "NSE.SPL.csv"
         before = f.read_bytes()
         ev = threading.Event()
         ev.set()
@@ -589,9 +261,9 @@ class NseBuildControlTests(unittest.TestCase):
 
     def test_stale_symbol_files_removed(self):
         nb.build(self.nse, demergers_csv=self.dm)
-        (self.nse / "official" / "NSE.GHOST.csv").write_text("Date,Open,High,Low,Close,Volume,Ticker\n")
+        (self.nse / "official_adjusted" / "NSE.GHOST.csv").write_text("Date,Open,High,Low,Close,Volume,Ticker\n")
         nb.build(self.nse, demergers_csv=self.dm, force=True)
-        self.assertFalse((self.nse / "official" / "NSE.GHOST.csv").exists())
+        self.assertFalse((self.nse / "official_adjusted" / "NSE.GHOST.csv").exists())
 
     def test_progress_reported(self):
         calls = []
@@ -643,7 +315,7 @@ def yf_frame(dates, closes):
 class YahooIncrementalTests(unittest.TestCase):
     def setUp(self):
         self._td = tmpdir()
-        self.raw = Path(self._td.name) / "LSE" / "raw"
+        self.raw = Path(self._td.name) / "LSE" / "yahoo_adjusted"
         self.raw.mkdir(parents=True)
         self.dates = pd.bdate_range("2026-10-01", "2026-10-23")
         self.c = 100 + np.arange(len(self.dates), dtype=float)
@@ -726,15 +398,19 @@ class CliArgsTests(unittest.TestCase):
         self.assertFalse(parse(["--no-metastock-ascii"]).metastock_ascii)
         self.assertTrue(parse(["--metastock-ascii"]).metastock_ascii)
 
-    def test_raw_basis_defaults_to_yahoo(self):
+    def test_raw_basis_keeps_alpaca_and_uses_yahoo_for_nse(self):
         a = parse(["--price-basis", "raw"])
-        self.assertEqual((a.us_source, a.nse_source), ("yahoo", "yahoo"))
+        self.assertEqual((a.us_source, a.nse_source), ("alpaca", "yahoo"))
 
-    def test_raw_basis_with_adjusted_source_is_an_error(self):
-        for argv in (["--price-basis", "raw", "--us-source", "alpaca"],
-                     ["--price-basis", "raw", "--nse-source", "bhavcopy"]):
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                parse(argv)
+    def test_raw_basis_with_nse_bhavcopy_is_an_error(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse(["--price-basis", "raw", "--nse-source", "bhavcopy"])
+
+    def test_old_layouts_mean_combined_and_default_is_none(self):
+        for v in ("daily", "per-symbol", "all", "combined"):
+            self.assertEqual(parse(["--layout", v]).layout, "combined")
+        self.assertEqual(parse(["--layout", "none"]).layout, "none")
+        self.assertEqual(parse([]).layout, "none")
 
     def test_source_of(self):
         a = parse([])
@@ -749,12 +425,26 @@ class CliArgsTests(unittest.TestCase):
             self.assertIn('"--metastock-ascii", action=argparse.BooleanOptionalAction, default=True', src)
 
 
+META_COLS = ["key", "symbol", "status", "delisted", "start", "sig", "first", "last", "bars", "cut", "f_last",
+             "last_close", "after_date", "after_close", "dup_of", "exit_price", "exit_why"]
+
+
 def make_alpaca(ex_dir: Path):
-    a = ex_dir / "alpaca"
-    a.mkdir(parents=True)
-    au._write(a / f"{ex_dir.name}.AAA.csv", frame(ALL, series(ALL, 10)), "AAA")
-    au._write(a / f"{ex_dir.name}.BRK.B.csv", frame(ALL, series(ALL, 500)), "BRK.B")
-    au._write(a / f"{ex_dir.name}.AAA@2026-09-30.csv", frame(HIST[:15], series(HIST[:15], 3)), "AAA@2026-09-30")
+    """A synthetic Alpaca store (market_data_alpaca/ layout: as-traded pickles + meta + corp_actions) next to
+    `ex_dir`'s market_data_daily, and alpaca_store.store_dir() pointed at it (undone by mock.patch.stopall)."""
+    ex = ex_dir.name
+    store = ex_dir.parent.parent / "market_data_alpaca_test"
+    (store / "daily" / ex).mkdir(parents=True, exist_ok=True)
+    rows = []
+    for key, dates, base in (("AAA", ALL, 10), ("BRK.B", ALL, 500), ("AAA@2026-09-30", HIST[:15], 3)):
+        df = frame(dates, series(dates, base))
+        df["f_split"] = df["f_spinoff"] = df["f_all"] = 1.0
+        df.to_pickle(store / "daily" / ex / f"{key}.pkl")
+        rows.append([key, key.split("@")[0], "active", "", str(dates[0].date()), "", dates[0], dates[-1], len(dates),
+                     "", 1.0, float(df["Close"].iloc[-1]), "", np.nan, "", float(df["Close"].iloc[-1]), "last close"])
+    pd.DataFrame(rows, columns=META_COLS).to_csv(store / f"meta_{ex}.csv", index=False)
+    pd.DataFrame(columns=["year", "type", "symbol", "date", "record"]).to_csv(store / "corp_actions.csv", index=False)
+    mock.patch.object(alpaca_store, "store_dir", return_value=store).start()
 
 
 def header(p: Path):
@@ -768,9 +458,10 @@ class CliEndToEndTests(unittest.TestCase):
         self._td = tmpdir()
         self.out = Path(self._td.name) / "out"
         make_alpaca(self.out / "NYSE")
+        self.addCleanup(mock.patch.stopall)
         self.dm = ROOT / "nse_demergers.csv"
         make_nse(self.out / "NSE", Path(self._td.name) / "unused_demergers.csv")
-        raw = self.out / "LSE" / "raw"
+        raw = self.out / "LSE" / "yahoo_adjusted"
         raw.mkdir(parents=True)
         df = yf_frame(ALL, series(ALL, 120)).reset_index()[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df["Ticker"] = "VOD"
@@ -786,51 +477,65 @@ class CliEndToEndTests(unittest.TestCase):
             core.main()
         drop_file_handlers(self.out)
 
-    def test_alpaca_and_nse_sources_all_layouts_metastock(self):
-        self.main("--exchanges", "NYSE", "NSE", "--layout", "all", "--start", "2025-01-01")
+    def test_alpaca_and_nse_sources_combined_and_bhavcopy_metastock(self):
+        self.main("--exchanges", "NYSE", "NSE", "--layout", "combined", "--start", "2025-01-01")
         nyse, nse = self.out / "NYSE", self.out / "NSE"
-        for d in ("daily_alpaca", "by_symbol_alpaca", "combined_alpaca"):
-            self.assertTrue((nyse / d).is_dir(), d)
-        for d in ("daily_official", "by_symbol_official", "combined_official"):
-            self.assertTrue((nse / d).is_dir(), d)
-        self.assertTrue(any((nyse / "bhavcopy_alpaca").glob("NYSE_*.csv")))
-        self.assertTrue(any((nse / "bhavcopy_official").glob("NSE_*.csv")))
-        day = nyse / "daily_alpaca" / "20261106.csv"
+        for ex_dir in (nyse, nse):
+            self.assertTrue((ex_dir / "combined_adjusted" / "all_data.csv").is_file())
+            for d in ("daily_adjusted", "by_symbol_adjusted", "yahoo_adjusted_never"):
+                self.assertFalse((ex_dir / d).exists(), d)           # the per-day / per-symbol folders are gone
+        self.assertTrue((nyse / "alpaca_exits.csv").is_file())
+        self.assertTrue(any((nse / "bhavcopy_adjusted").glob("NSE_*.csv")))
+        day = nyse / "bhavcopy_adjusted" / "NYSE_20261106.csv"
         self.assertEqual(header(day), METASTOCK_HEADER)
         self.assertIn(b"\r\n", day.read_bytes())
         body = pd.read_csv(day)
         self.assertEqual(sorted(body["<TICKER>"]), ["AAA", "BRK.B"])
-        old = pd.read_csv(nyse / "daily_alpaca" / "20260901.csv")
+        old = pd.read_csv(nyse / "bhavcopy_adjusted" / "NYSE_20260901.csv")
         self.assertEqual(sorted(old["<TICKER>"]), ["AAA", "AAA@2026-09-30", "BRK.B"])   # delisted key included
-        nse_day = pd.read_csv(nse / "daily_official" / "20260105.csv")
+        nse_day = pd.read_csv(nse / "bhavcopy_adjusted" / "NSE_20260105.csv")
         self.assertIn("DEL", set(nse_day["<TICKER>"]))                                  # delisted included
         self.assertIn("NEWN", set(nse_day["<TICKER>"]))                                 # renamed, joined
-        self.assertFalse((nyse / "daily").exists())                                     # Yahoo folders untouched
+        self.assertFalse((nyse / "yahoo_adjusted").exists())                            # Yahoo folders untouched
+
+    def test_alpaca_raw_basis_is_as_traded(self):
+        self.main("--exchanges", "NYSE", "--price-basis", "raw", "--layout", "combined", "--no-metastock-ascii",
+                  "--start", "2025-01-01")
+        nyse = self.out / "NYSE"
+        self.assertTrue((nyse / "combined_raw" / "all_data.csv").is_file())
+        self.assertTrue(any((nyse / "bhavcopy_raw").glob("NYSE_*.csv")))
+        self.assertFalse((nyse / "combined_adjusted").exists())
 
     def test_plain_layout_and_single_ticker(self):
-        self.main("--exchanges", "NYSE", "--ticker", "brk.b", "--ticker-exchange", "NYSE", "--layout", "per-symbol",
-                  "--no-metastock-ascii", "--no-bhavcopy", "--start", "2025-01-01")
-        files = sorted(p.name for p in (self.out / "NYSE" / "by_symbol_alpaca").glob("*.csv"))
-        self.assertEqual(len(files), 1)
-        self.assertEqual(header(self.out / "NYSE" / "by_symbol_alpaca" / files[0]).split(",")[0], "Symbol")
+        self.main("--exchanges", "NYSE", "--ticker", "brk.b", "--ticker-exchange", "NYSE",
+                  "--layout", "combined", "--no-metastock-ascii", "--no-bhavcopy", "--start", "2025-01-01")
+        f = self.out / "NYSE" / "combined_adjusted" / "all_data.csv"
+        self.assertEqual(header(f).split(",")[0], "Symbol")
+        self.assertEqual(set(pd.read_csv(f)["Symbol"]), {"NYSE.BRK.B"})
+
+    def test_default_writes_only_the_day_files(self):
+        self.main("--exchanges", "NYSE", "NSE", "--start", "2025-01-01")
+        for ex in ("NYSE", "NSE"):
+            self.assertTrue(any((self.out / ex / "bhavcopy_adjusted").glob(f"{ex}_*.csv")))
+            self.assertFalse((self.out / ex / "combined_adjusted").exists())
+            self.assertFalse((self.out / ex / "daily_adjusted").exists())
 
     def test_yahoo_exchange_unchanged_path(self):
         self.main("--exchanges", "LSE", "--ticker", "VOD", "--ticker-exchange", "LSE", "--start", "2025-01-01")
-        day = self.out / "LSE" / "daily" / "20261106.csv"
+        day = self.out / "LSE" / "bhavcopy_adjusted" / "LSE_20261106.csv"
         self.assertEqual(header(day), METASTOCK_HEADER)
-        self.assertTrue(any((self.out / "LSE" / "bhavcopy").glob("LSE_*.csv")))
 
     def test_yahoo_source_for_nse_when_chosen(self):
         self.main("--exchanges", "NSE", "--nse-source", "yahoo", "--ticker", "SPL", "--ticker-exchange", "NSE",
                   "--start", "2025-01-01")
-        self.assertFalse((self.out / "NSE" / "official").exists())                     # bhavcopy path not used
+        self.assertFalse((self.out / "NSE" / "official_adjusted").exists())                     # bhavcopy path not used
 
     def test_source_tickers(self):
         src_dir, t = core.source_tickers("NYSE", self.out / "NYSE", "alpaca", wanted=["aaa", "nope"])
         self.assertEqual(t, ["AAA"])
         _, t = core.source_tickers("NYSE", self.out / "NYSE", "alpaca", limit=1)
         self.assertEqual(len(t), 1)
-        _, t = core.source_tickers("NYSE", self.out / "MISSING", "alpaca")
+        _, t = core.source_tickers("NASDAQ", self.out / "NASDAQ", "alpaca")          # no store for NASDAQ
         self.assertEqual(t, [])
 
 
@@ -848,10 +553,11 @@ class GuiTests(unittest.TestCase):
         self.tmp = Path(self._td.name)
         self.out = self.tmp / "out"
         make_alpaca(self.out / "NYSE")
+        self.addCleanup(mock.patch.stopall)
         make_nse(self.out / "NSE", self.tmp / "unused.csv")
         nb.update_corporate_actions(self.out / "NSE" / "nse_ca", download=False)
         nb.build(self.out / "NSE")
-        raw = self.out / "LSE" / "raw"
+        raw = self.out / "LSE" / "yahoo_adjusted"
         raw.mkdir(parents=True)
         df = yf_frame(ALL, series(ALL, 120)).reset_index()[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df["Ticker"] = "VOD"
@@ -901,7 +607,7 @@ class GuiTests(unittest.TestCase):
         self.downloads.append((Path(raw_dir).parent.name, sorted(tickers)))
         return []
 
-    def configure(self, markets=(), selected=None, layout="daily", start="2025-01-01"):
+    def configure(self, markets=(), selected=None, layout="combined", start="2025-01-01"):
         for ex, var in self.app.market_vars.items():
             var.set(ex in markets)
         if selected is None:
@@ -930,24 +636,25 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(self.app.is_running, "GUI run did not finish")
 
     def test_defaults(self):
+        self.assertEqual([ex for ex, v in self.app.market_vars.items() if v.get()], ["NASDAQ", "NYSE", "NSE"])
         self.assertTrue(self.app.metastock_ascii_var.get())
         self.assertTrue(self.app.us_alpaca_var.get())
         self.assertTrue(self.app.nse_official_var.get())
 
     def test_all_mode_uses_sources_and_builds_suffixed_folders(self):
-        self.configure(markets=("NYSE", "NSE"), layout="all")
+        self.configure(markets=("NYSE", "NSE"), layout="combined")
         self.run_gui()
         self.assertEqual(self.boxes[-1][0], "info", self.boxes)
         self.assertEqual(sorted(self.updates), [("NSE", "bhavcopy", None), ("NYSE", "alpaca", None)])
         self.assertEqual(self.downloads, [])
-        for d in ("daily_alpaca", "by_symbol_alpaca", "combined_alpaca", "bhavcopy_alpaca"):
+        for d in ("combined_adjusted", "bhavcopy_adjusted"):
             self.assertTrue((self.out / "NYSE" / d).is_dir(), d)
-        for d in ("daily_official", "by_symbol_official", "combined_official", "bhavcopy_official"):
+        for d in ("combined_adjusted", "bhavcopy_adjusted"):
             self.assertTrue((self.out / "NSE" / d).is_dir(), d)
-        day = self.out / "NSE" / "daily_official" / "20260302.csv"
+        day = self.out / "NSE" / "bhavcopy_adjusted" / "NSE_20260302.csv"
         self.assertEqual(header(day), METASTOCK_HEADER)
         self.assertIn("NEWN", set(pd.read_csv(day)["<TICKER>"]))
-        self.assertFalse((self.out / "NYSE" / "daily").exists())
+        self.assertFalse((self.out / "NYSE" / "yahoo_adjusted").exists())
 
     def test_selected_tickers_split_between_sources_and_yahoo(self):
         self.configure(selected={"AAA": "NYSE", "SPL": "NSE", "VOD": "LSE"})
@@ -955,11 +662,11 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.boxes[-1][0], "info", self.boxes)
         self.assertEqual(sorted(self.updates), [("NSE", "bhavcopy", ["SPL"]), ("NYSE", "alpaca", ["AAA"])])
         self.assertEqual(self.downloads, [("LSE", ["VOD"])])
-        self.assertEqual(set(pd.read_csv(self.out / "NYSE" / "daily_alpaca" / "20261106.csv")["<TICKER>"]),
+        self.assertEqual(set(pd.read_csv(self.out / "NYSE" / "bhavcopy_adjusted" / "NYSE_20261106.csv")["<TICKER>"]),
                          {"AAA"})
-        self.assertEqual(set(pd.read_csv(self.out / "NSE" / "daily_official" / "20260302.csv")["<TICKER>"]),
+        self.assertEqual(set(pd.read_csv(self.out / "NSE" / "bhavcopy_adjusted" / "NSE_20260302.csv")["<TICKER>"]),
                          {"SPL"})
-        self.assertTrue((self.out / "LSE" / "daily" / "20261106.csv").exists())
+        self.assertTrue((self.out / "LSE" / "bhavcopy_adjusted" / "LSE_20261106.csv").exists())
         self.assertIn("3 ticker(s)", self.boxes[-1][2])
 
     def test_sources_unticked_fall_back_to_yahoo(self):
@@ -969,14 +676,14 @@ class GuiTests(unittest.TestCase):
         self.run_gui()
         self.assertEqual(self.updates, [])
         self.assertEqual(sorted(self.downloads), [("NSE", ["SPL"]), ("NYSE", ["AAA"])])
-        self.assertFalse((self.out / "NYSE" / "daily_alpaca").exists())
+        self.assertFalse((self.out / "NYSE" / "yahoo_adjusted").exists())
 
     def test_update_failure_still_builds_from_existing_files(self):
         self.update_error = "no working Alpaca key"
         self.configure(selected={"AAA": "NYSE"})
         self.run_gui()
         self.assertEqual(self.boxes[-1][0], "info")
-        self.assertTrue((self.out / "NYSE" / "daily_alpaca" / "20261106.csv").exists())
+        self.assertTrue((self.out / "NYSE" / "bhavcopy_adjusted" / "NYSE_20261106.csv").exists())
         self.assertIn("no working Alpaca key", self.app.log_text.get("1.0", "end"))
 
     def test_cancel_during_source_update(self):
@@ -985,15 +692,15 @@ class GuiTests(unittest.TestCase):
         self.run_gui()
         self.assertEqual(self.boxes[-1][1], "Download cancelled")
         self.assertEqual(len(self.updates), 1)                       # the second exchange never started
-        self.assertFalse((self.out / "NYSE" / "daily_alpaca").exists())
+        self.assertFalse((self.out / "NYSE" / "yahoo_adjusted").exists())
 
     def test_no_bhavcopy_and_plain_format(self):
         self.app.bhavcopy_var.set(False)
         self.app.metastock_ascii_var.set(False)
         self.configure(selected={"AAA": "NYSE"})
         self.run_gui()
-        self.assertFalse((self.out / "NYSE" / "bhavcopy_alpaca").exists())
-        self.assertTrue(header(self.out / "NYSE" / "daily_alpaca" / "20261106.csv").startswith("Symbol,"))
+        self.assertFalse((self.out / "NYSE" / "bhavcopy_adjusted").exists())
+        self.assertTrue(header(self.out / "NYSE" / "combined_adjusted" / "all_data.csv").startswith("Symbol,"))
 
     def test_settings_round_trip_and_defaults_for_old_files(self):
         self.app.us_alpaca_var.set(False)
@@ -1016,6 +723,23 @@ class GuiTests(unittest.TestCase):
         self.app.withdraw()
         self.assertTrue(self.app.us_alpaca_var.get() and self.app.nse_official_var.get()
                         and self.app.metastock_ascii_var.get())
+
+    def test_dates_default_to_today_with_quick_ranges(self):
+        from datetime import date as _date, timedelta as _td
+        today = _date.today().isoformat()
+        self.assertEqual(self.app.date_preset_var.get(), "1D")
+        self.assertEqual((self.app._get_start_date_str(), self.app._get_end_date_str()), (today, today))
+        self.app.date_preset_var.set("1W")
+        self.app._apply_preset()
+        self.assertEqual(self.app._get_start_date_str(), (_date.today() - _td(days=7)).isoformat())
+        self.app._save_settings()
+        self.app.destroy()
+        self.app = self.gui_mod.MarketDataGUI()
+        self.app.withdraw()
+        self.assertEqual(self.app.date_preset_var.get(), "1W")
+        self.app._set_dates(_date(2020, 1, 1), _date(2020, 2, 1))
+        self.app._on_manual_date()
+        self.assertEqual(self.app.date_preset_var.get(), "")
 
     def test_hourly_mode_greys_out_sources(self):
         self.app.interval_var.set("hourly")

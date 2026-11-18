@@ -30,8 +30,8 @@ Data sources
 ------------
 - NSE: NSE's official bhavcopies. NSE's corporate-actions history (splits, bonuses, ...) comes with this
   folder (seed_data), so only actions after that date are ever downloaded from nseindia.com.
-- NASDAQ / NYSE: Alpaca when <daily_output>\NYSE\alpaca\ (or NASDAQ\alpaca\) has files; otherwise
-  Yahoo Finance is used automatically (the log says so).
+- NASDAQ / NYSE: the Alpaca store (market_data_alpaca folder, set alpaca_data in eod_config.ini) when it exists;
+  otherwise Yahoo Finance is used automatically (the log says so). The store is not part of this folder.
 - Every other exchange: Yahoo Finance.
 
 Command line (optional)
@@ -46,5 +46,5 @@ README.md has the full manual (where it says "python eod_downloader.py", use "cl
 
 Private files
 -------------
-.alpaca3.env and .alpaca2.env hold Alpaca API keys that were shared with you personally.
-Don't pass them on or upload them anywhere.
+Outputs per exchange: combined_adjusted/all_data.csv and bhavcopy_adjusted/<EX>_YYYYMMDD.csv (as traded:
+combined_raw/ and bhavcopy_raw/).

@@ -2,7 +2,7 @@
 
 as_traded_price = yahoo_price * Factor          (volume: as_traded_volume = yahoo_volume / Factor)
 
-Needs official_cache/full/ (run nse_delisted.py first). Writes under <root>/NSE/recon/:
+Needs official_raw/full/ (run nse_delisted.py first). Writes under <root>/NSE/recon/:
   scale_factors.csv   Symbol,From,To,Factor,Days,Clean   one row per constant-factor segment (To is inclusive)
   factor_outliers.csv Symbol,Date,Official,Yahoo,Ratio   days that fit no segment (bad Yahoo/official bar)
   factor_check.csv    one-line summary of how well the segments reproduce the official closes
@@ -89,7 +89,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     nse = Path(args.root) / "NSE"
-    raw_dir, cache, out = nse / "raw", nse / "official_cache" / "full", nse / "recon"
+    raw_dir, cache, out = nse / "yahoo_adjusted", nse / "official_raw" / "full", nse / "recon"
     out.mkdir(exist_ok=True)
 
     log.info("Loading official closes ...")
@@ -99,7 +99,7 @@ def main():
     off = off.sort_values(["Symbol", "Date", "_eq"]).drop_duplicates(["Symbol", "Date"], keep="last")
     off = off[off.Close > 0].set_index(["Symbol", "Date"]).Close
 
-    log.info("Loading Yahoo raw/ ...")
+    log.info("Loading Yahoo yahoo_adjusted/ ...")
     frames = []
     for p in raw_dir.glob("NSE.*.csv"):
         if p.stat().st_size < 30:

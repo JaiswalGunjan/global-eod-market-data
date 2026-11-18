@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="eod-token" content="__EOD_TOKEN__">
+<title>Market Data Downloader</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M7 22l6-7 5 4 7-9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32"><path d="M6 23l6-7 5 4 9-11" /></svg>
+    </div>
+    <div>
+      <h1>Market Data Downloader</h1>
+      <div class="tagline">End-of-day &amp; hourly prices &middot; MetaStock-ready CSVs</div>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="run-pill" class="pill idle"><span class="dot"></span><span id="run-pill-text">Ready</span></span>
+    <button id="quit" type="button" class="ghost-light" title="Stop the app (the console window closes too)">Quit app</button>
+  </div>
+</header>
+
+<main id="settings">
+  <div class="grid">
+    <!-- 1. Market -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="step">1</span>
+        <div><h2>Markets</h2><p>Pick the exchanges to download.</p></div>
+        <div class="head-actions">
+          <button id="load-file" type="button" class="subtle">Load tickers from file...</button>
+          <button id="refresh" type="button" class="blue">Refresh ticker list</button>
+          <input id="file-input" type="file" accept=".csv,text/csv" hidden>
+        </div>
+      </div>
+      <div id="markets" class="chips"></div>
+      <div class="option-group">
+        <div class="group-title">Data sources <span class="muted">&mdash; adjusted for splits / spin-offs / demergers, delisted companies included</span></div>
+        <label class="switch-row"><input type="checkbox" class="switch" id="us_source_alpaca">
+          <span><b>NASDAQ / NYSE from Alpaca</b><small>From the Alpaca store; output in &lt;EX&gt;/combined_adjusted, bhavcopy_adjusted</small></span></label>
+        <label class="switch-row"><input type="checkbox" class="switch" id="nse_source_official">
+          <span><b>NSE from NSE's official bhavcopies + corporate actions</b><small>Output in NSE/combined_adjusted, bhavcopy_adjusted</small></span></label>
+        <div class="note">Switched off = Yahoo Finance (as for every other exchange); output in &lt;EX&gt;/combined_adjusted, bhavcopy_adjusted</div>
+        <label class="switch-row"><input type="checkbox" class="switch" id="bse_bhavcopy">
+          <span><b>BSE from BSE's official daily files</b><small>Complete, incl. BSE-only stocks; slower first run. Instead of Yahoo.</small></span></label>
+        <label class="switch-row indent"><input type="checkbox" class="switch" id="bse_adjust">
+          <span><b>...and adjust those BSE prices for splits / bonuses</b><small>Via Yahoo's corporate-actions data</small></span></label>
+      </div>
+    </section>
+
+    <!-- 2. Ticker(s) -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="step">2</span>
+        <div><h2>Tickers</h2><p>Every ticker of the selected markets, or only the ones you pick.</p></div>
+        <span id="ticker-status" class="badge"></span>
+      </div>
+      <label class="switch-row"><input type="checkbox" class="switch" id="all">
+        <span><b>ALL</b><small>Every ticker in the selected market(s)</small></span></label>
+      <div class="picker" id="picker">
+        <div class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <input id="search" type="text" autocomplete="off" spellcheck="false" placeholder="Search symbol or company name, then Enter">
+          <button id="search-btn" type="button" class="blue">Search</button>
+        </div>
+        <div class="lists">
+          <div class="list-col">
+            <div class="list-title">Matches <span class="muted">&mdash; select + Add, or double-click</span></div>
+            <select id="matches" multiple size="8"></select>
+          </div>
+          <div class="list-buttons">
+            <button id="add" type="button" class="green">Add &#9656;</button>
+            <button id="remove" type="button" class="amber">&#9666; Remove</button>
+            <button id="clear" type="button" class="danger-ghost">Clear all</button>
+          </div>
+          <div class="list-col">
+            <div class="list-title">Selected tickers</div>
+            <select id="selected" multiple size="8"></select>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Date range -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="step">3</span>
+        <div><h2>Date range</h2><p>End date included.</p></div>
+      </div>
+      <div class="dates">
+        <label class="field"><span>Start</span><input id="start" type="date"></label>
+        <span class="arrow" aria-hidden="true">&rarr;</span>
+        <label class="field"><span>End</span><input id="end" type="date"></label>
+      </div>
+      <div class="field-label">Quick range</div>
+      <div id="presets" class="segmented"></div>
+    </section>
+
+    <!-- 4. Save location -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="step">4</span>
+        <div><h2>Save location</h2><p>Each exchange gets its own folder inside it.</p></div>
+      </div>
+      <div class="input-group">
+        <input id="output" type="text" spellcheck="false">
+      </div>
+      <div class="row">
+        <button id="browse" type="button" class="teal">Browse...</button>
+        <button id="open-folder" type="button" class="subtle">Open folder</button>
+      </div>
+      <div class="note" id="config-hint"></div>
+    </section>
+
+    <!-- 5. Output: interval, CSV layout -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="step">5</span>
+        <div><h2>Output</h2><p>Data is always saved per exchange: &lt;save location&gt;/&lt;EXCHANGE&gt;/ (e.g. NSE/, NASDAQ/, NYSE/)</p></div>
+      </div>
+      <div class="field-row">
+        <div>
+          <div class="field-label">Data interval</div>
+          <div class="segmented" id="intervals">
+            <label><input type="radio" name="interval" value="daily"><span>Daily</span></label>
+            <label><input type="radio" name="interval" value="hourly"><span>Hourly &middot; NSE/NASDAQ/NYSE, ~2 years</span></label>
+          </div>
+        </div>
+        <div>
+          <div class="field-label">CSV layout</div>
+          <div id="layouts" class="segmented"></div>
+        </div>
+      </div>
+      <div id="interval-note" class="callout"></div>
+      <label class="switch-row"><input type="checkbox" class="switch" id="metastock_ascii">
+        <span><b>MetaStock ASCII format</b><small>&lt;TICKER&gt;,&lt;PER&gt;,&lt;DTYYYYMMDD&gt;,&lt;OPEN&gt;,&lt;HIGH&gt;,&lt;LOW&gt;,&lt;CLOSE&gt;,&lt;VOL&gt;</small></span></label>
+      <label class="switch-row"><input type="checkbox" class="switch" id="bhavcopy">
+        <span><b>Also write per-day bhavcopy files for MetaStock</b><small>&lt;EXCHANGE&gt;/bhavcopy*/&lt;EXCHANGE&gt;_YYYYMMDD.csv</small></span></label>
+    </section>
+
+    <!-- Log -->
+    <section class="card span-12 log-card">
+      <div class="card-head">
+        <span class="step icon" aria-hidden="true">&#8801;</span>
+        <div><h2>Activity log</h2><p>Everything the download does, live.</p></div>
+      </div>
+      <div id="log" class="console" role="log" aria-live="polite"></div>
+    </section>
+  </div>
+</main>
+
+<footer class="bottombar">
+  <div class="bar-inner">
+    <button id="run" type="button" class="cta">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+      <span id="run-label">Download</span>
+    </button>
+    <button id="cancel" type="button" class="danger-ghost" disabled>Cancel</button>
+    <div class="progress-wrap">
+      <progress id="progress" value="0" max="1"></progress>
+      <div id="status" class="status-text">Ready.</div>
+    </div>
+  </div>
+</footer>
+
+<!-- message box -->
+<dialog id="msg-dialog">
+  <div class="dlg-head"><span class="dlg-icon" aria-hidden="true"></span><h2 id="msg-title"></h2></div>
+  <pre id="msg-text"></pre>
+  <div class="row right" id="msg-buttons"></div>
+</dialog>
+
+<!-- folder picker -->
+<dialog id="dir-dialog" class="wide">
+  <div class="dlg-head"><span class="dlg-icon folder" aria-hidden="true"></span><h2>Choose the save location</h2></div>
+  <div class="row">
+    <input id="dir-path" type="text" class="grow" spellcheck="false">
+    <button id="dir-go" type="button" class="blue">Go</button>
+    <button id="dir-up" type="button" class="subtle" title="Parent folder">&uarr; Up</button>
+  </div>
+  <div class="row" id="dir-roots"></div>
+  <ul id="dir-list"></ul>
+  <div class="note">Double-click a folder to open it. A folder that doesn't exist yet can be typed above; it's created on the first run.</div>
+  <div class="row right">
+    <button id="dir-cancel" type="button" class="subtle">Cancel</button>
+    <button id="dir-ok" type="button" class="green">Use this folder</button>
+  </div>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
